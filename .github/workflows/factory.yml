@@ -1,0 +1,46 @@
+name: factory
+# Every trigger runs this file from main, so fire tokens never reach branch code.
+on:
+  push:
+    branches: [main]
+    paths: [GOALS.md]
+  issue_comment:
+    types: [created]
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+  pull_request_target:
+    types: [closed]
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+concurrency:
+  group: factory
+  cancel-in-progress: false
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+  checks: read
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node .github/factory/run.mjs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          FACTORY_ROUTINE_ID: ${{ vars.FACTORY_ROUTINE_ID }}
+          FACTORY_FIRE_TOKEN: ${{ secrets.FACTORY_FIRE_TOKEN }}
+          FACTORY_ROUTINE_ID_PLANNER: ${{ vars.FACTORY_ROUTINE_ID_PLANNER }}
+          FACTORY_FIRE_TOKEN_PLANNER: ${{ secrets.FACTORY_FIRE_TOKEN_PLANNER }}
+          FACTORY_ROUTINE_ID_WORKER: ${{ vars.FACTORY_ROUTINE_ID_WORKER }}
+          FACTORY_FIRE_TOKEN_WORKER: ${{ secrets.FACTORY_FIRE_TOKEN_WORKER }}
+          FACTORY_ROUTINE_ID_ESCALATION: ${{ vars.FACTORY_ROUTINE_ID_ESCALATION }}
+          FACTORY_FIRE_TOKEN_ESCALATION: ${{ secrets.FACTORY_FIRE_TOKEN_ESCALATION }}
