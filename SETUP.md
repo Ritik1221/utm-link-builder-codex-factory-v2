@@ -23,8 +23,10 @@
 4. With GitHub Pro: add a ruleset on `main` requiring a pull request and the `ci` check
    (the dispatcher merges through the pull request, so it keeps working).
    Also move the fire-token secrets into an environment limited to `main` and add
-   `environment: <name>` to the `dispatch` job. Until then, a workflow file pushed
-   to any branch could read them; the agent hook discourages that but cannot prevent it.
+   `environment: <name>` to the `dispatch` job. Until then `main` is unprotected and a
+   workflow file pushed to any branch can read the fire token and ask for a write token
+   (verified). The agent hook and the protected-path check discourage that but cannot
+   prevent it, so on GitHub Free use the factory for disposable code only.
 5. Write your goals in `GOALS.md` and push to `main`. Watch the issue named "Factory status".
 
 ## What you do, and what you never do
