@@ -2,16 +2,14 @@
 
 This is the only file you maintain. Agents read it and never edit it.
 
-Write one section per goal. The heading must have this exact form, with a number you never reuse:
-
-    ## G1: Short name of the goal
-
-Under each heading, say what the user can do and how you would check it works. Nothing is built until at least one such heading exists.
-
 ## Product
 
-(One paragraph: what this product is and who it is for.)
+A tiny service used to smoke-test the factory.
+
+## G1: Health endpoint
+
+A Node.js HTTP server (no framework, no dependencies) answers `GET /health` with status 200 and the JSON body `{"status":"ok"}`. Any other path answers 404. `npm test` proves both using Node's built-in test runner.
 
 ## Constraints
 
-(Optional: things that must or must not be used.)
+No web framework and no runtime dependencies. This is not a Next.js app.
