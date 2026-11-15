@@ -10,6 +10,10 @@ A tiny service used to smoke-test the factory.
 
 A Node.js HTTP server (no framework, no dependencies) answers `GET /health` with status 200 and the JSON body `{"status":"ok"}`. Any other path answers 404. `npm test` proves both using Node's built-in test runner.
 
+## G2: Version endpoint
+
+`GET /version` answers with status 200 and the JSON body `{"version":"<version from package.json>"}`. `npm test` proves it.
+
 ## Constraints
 
 No web framework and no runtime dependencies. This is not a Next.js app.
