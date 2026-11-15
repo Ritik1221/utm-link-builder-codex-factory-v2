@@ -306,3 +306,13 @@ test('an open task with no state label goes to needs-human and keeps its PRs', (
 test('over-long titles are rejected', () => {
   assert.ok(validatePlan({ goals_sha: 'abc', tasks: [{ ...T1, title: 'x'.repeat(201) }] }, ['G1']).length > 0);
 });
+
+test('duplicate issues for one task are superseded, keeping the one furthest along', () => {
+  const started = issue(T1, 4, 'in-progress', { meta: { id: 'G1-T1', hash: taskHash(T1), attempt: 1, leaseAt: NOW } });
+  assert.deepEqual(decide(state({ plan: plan1, issues: [issue(T1, 3, 'ready'), started] })), [{ type: 'supersede', number: 3 }]);
+  assert.deepEqual(decide(state({ plan: plan1, issues: [issue(T1, 3, 'planned'), issue(T1, 4, 'planned')] })), [{ type: 'supersede', number: 4 }]);
+  // also while the plan is unusable, and never touching closed or superseded issues
+  assert.deepEqual(decide(state({ plan: null, issues: [issue(T1, 3, 'ready'), issue(T1, 4, 'ready')] }))[0], { type: 'supersede', number: 4 });
+  const done = issue(T1, 2, 'in-review', { open: false });
+  assert.deepEqual(decide(state({ plan: plan1, issues: [done, issue(T1, 5, 'ready')] })), [{ type: 'supersede', number: 5 }]);
+});

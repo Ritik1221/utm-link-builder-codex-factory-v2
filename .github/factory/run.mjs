@@ -77,7 +77,7 @@ async function loadStatus() {
   if (!s) s = await gh('POST', `${r}/issues`, { title: 'Factory status', body: withMeta('Starting.', {}), labels: ['factory-status'] });
   else if (s.state !== 'open') await gh('PATCH', `${r}/issues/${s.number}`, { state: 'open' });
   statusNumber = s.number;
-  return { number: s.number, body: s.body, plannerFiredSha: null, plannerFiredAt: 0, plannerFires: 0, ...parseMeta(s.body) };
+  return { number: s.number, body: s.body, plannerFiredSha: null, plannerFiredAt: 0, plannerFires: 0, pending: [], ...parseMeta(s.body) };
 }
 
 async function loadState() {
@@ -92,8 +92,16 @@ async function loadState() {
     if (m) prsById.set(m[1], [...(prsById.get(m[1]) ?? []), { ...p, attempt: Number(m[2]) }]);
   }
 
+  // The issue list lags behind a create. Issues created recently are recorded in
+  // the status marker and read by number until the list shows them.
+  const status = await loadStatus();
+  const listed = (await all(`${r}/issues?state=all&labels=factory-task`)).filter((x) => !x.pull_request);
+  const missing = status.pending.filter((n) => !listed.some((x) => x.number === n));
+  for (const n of missing) listed.push(await gh('GET', `${r}/issues/${n}`));
+  status.pending = missing;
+
   const issues = [];
-  for (const i of (await all(`${r}/issues?state=all&labels=factory-task`)).filter((x) => !x.pull_request)) {
+  for (const i of listed) {
     const meta = parseMeta(i.body);
     if (!meta?.id) continue;
     const prs = prsById.get(meta.id) ?? [];
@@ -116,7 +124,7 @@ async function loadState() {
   return {
     now: Date.now(), goalsSha, plan, issues,
     goalIds: parseGoalIds((await file('GOALS.md', 'main')) ?? ''),
-    status: await loadStatus(),
+    status,
     mainCi: await ciOf(main.sha),
   };
 }
@@ -126,7 +134,7 @@ async function setState(issue, to, metaPatch = {}) {
   await gh('PATCH', `${r}/issues/${issue.number}`, { labels, body: withMeta(issue.body, { ...issue.meta, ...metaPatch }) });
 }
 
-const planner = ({ plannerFiredSha, plannerFiredAt, plannerFires }) => ({ plannerFiredSha, plannerFiredAt, plannerFires });
+const planner = ({ plannerFiredSha, plannerFiredAt, plannerFires, pending }) => ({ plannerFiredSha, plannerFiredAt, plannerFires, pending });
 const saveStatus = (status, meta) => gh('PATCH', `${r}/issues/${status.number}`, { body: withMeta(status.body, meta) });
 
 // 'ok': a session started. 'refused': a 4xx, so no session exists.
@@ -160,7 +168,9 @@ async function apply(a, s, notes) {
   switch (a.type) {
     case 'create': {
       const { title, body } = renderIssue(a.task, { id: a.task.id, hash: taskHash(a.task), attempt: 0 });
-      await gh('POST', `${r}/issues`, { title, body, labels: ['factory-task', 'planned'] });
+      const made = await gh('POST', `${r}/issues`, { title, body, labels: ['factory-task', 'planned'] });
+      s.status.pending.push(made.number);
+      await saveStatus(s.status, planner(s.status));
       return false;
     }
     case 'update': {
@@ -202,7 +212,7 @@ async function apply(a, s, notes) {
         // Record first, so a crash after the call can never hide a fire.
         // An unanswered fire counts as a fire: the session may exist.
         const before = planner(s.status);
-        const fired = { plannerFiredSha: a.sha, plannerFiredAt: s.now, plannerFires: a.fires };
+        const fired = { ...before, plannerFiredSha: a.sha, plannerFiredAt: s.now, plannerFires: a.fires };
         await saveStatus(s.status, fired);
         if ((await fire(a.route, `ROLE=planner SHA=${a.sha}`)) === 'refused') {
           await saveStatus(s.status, before);

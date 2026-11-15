@@ -136,6 +136,14 @@ export function decide(s) {
   const planOk = planCurrent && !planErrors.length && s.goalIds.length > 0;
   const early = ['planned', 'ready'];
 
+  // One issue per task. GitHub's issue list can lag a create, so a duplicate is
+  // repaired here whatever caused it: keep the issue furthest along, then the oldest.
+  const rank = (i) => (!i.open ? 3 : early.includes(stateOf(i)) ? 1 : 2);
+  const keep = new Map();
+  for (const i of [...live].sort((a, b) => rank(b) - rank(a) || a.number - b.number)) if (!keep.has(i.meta.id)) keep.set(i.meta.id, i);
+  const dupes = live.filter((i) => keep.get(i.meta.id) !== i && i.open && early.includes(stateOf(i)));
+  if (dupes.length) return dupes.map((i) => ({ type: 'supersede', number: i.number }));
+
   if (planOk) {
     const sync = [];
     const byId = new Map(live.map((i) => [i.meta.id, i]));
