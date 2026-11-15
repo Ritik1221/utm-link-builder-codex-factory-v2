@@ -316,3 +316,13 @@ test('duplicate issues for one task are superseded, keeping the one furthest alo
   const done = issue(T1, 2, 'in-review', { open: false });
   assert.deepEqual(decide(state({ plan: plan1, issues: [done, issue(T1, 5, 'ready')] })), [{ type: 'supersede', number: 5 }]);
 });
+
+test('a superseded duplicate never closes the pull request of the live issue', () => {
+  const openPrs = [{ number: 5, attempt: 1 }];
+  const dup = issue(T1, 3, 'superseded', { open: false, labels: ['factory-task', 'superseded'], openPrs });
+  const live = issue(T1, 4, 'in-progress', { meta: { id: 'G1-T1', hash: taskHash(T1), attempt: 1, leaseAt: NOW }, openPrs });
+  assert.deepEqual(decide(state({ plan: plan1, issues: [dup, live] })), []);
+  // a task dropped from the plan still has its pull request closed
+  const T9 = { ...T1, id: 'G1-T9' };
+  assert.deepEqual(decide(state({ plan: { goals_sha: 'abc', tasks: [T9] }, issues: [dup, issue(T9, 6, 'ready')] }))[0], { type: 'closePr', number: 5, issue: 3 });
+});

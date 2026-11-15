@@ -171,7 +171,9 @@ export function decide(s) {
       moves.push({ type: 'state', number: i.number, to: 'needs-human', reason: 'attempts exhausted', meta: { tries: 0 } });
       continue;
     }
-    for (const p of stalePrs(i)) moves.push({ type: 'closePr', number: p.number, issue: i.number });
+    // A superseded issue gives no say over PRs that a live issue for the same task owns.
+    const owner = i.labels.includes('superseded') ? keep.get(i.meta.id) : i;
+    if (!owner || owner === i) for (const p of stalePrs(i)) moves.push({ type: 'closePr', number: p.number, issue: i.number });
     if (st === 'in-progress' || st === 'in-review') {
       const m = i.meta;
       const lease = m.leaseAt ?? 0;
