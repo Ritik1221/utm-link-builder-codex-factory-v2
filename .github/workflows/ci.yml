@@ -3,6 +3,8 @@ on:
   pull_request:
   push:
     branches: [main]
+permissions:
+  contents: read
 jobs:
   ci: # the dispatcher reads the check run by this name
     runs-on: ubuntu-latest
@@ -12,10 +14,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: node --test .github/factory/lib.test.mjs
+      - run: node --test .github/factory/*.test.mjs
+      - run: node .github/factory/scan.mjs
       - if: hashFiles('package.json') != ''
         run: |
-          npm ci
+          if [ -f package-lock.json ]; then npm ci && npm audit --audit-level=high; else npm install --no-audit --no-fund; fi
           npm run lint --if-present
           npm run typecheck --if-present
           npm test --if-present

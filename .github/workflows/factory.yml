@@ -17,8 +17,9 @@ on:
 concurrency:
   group: factory
   cancel-in-progress: false
+# contents: write exists only so this job can merge a validated pull request.
 permissions:
-  contents: read
+  contents: write
   issues: write
   pull-requests: write
   checks: read
@@ -44,3 +45,5 @@ jobs:
           FACTORY_FIRE_TOKEN_WORKER: ${{ secrets.FACTORY_FIRE_TOKEN_WORKER }}
           FACTORY_ROUTINE_ID_ESCALATION: ${{ vars.FACTORY_ROUTINE_ID_ESCALATION }}
           FACTORY_FIRE_TOKEN_ESCALATION: ${{ secrets.FACTORY_FIRE_TOKEN_ESCALATION }}
+          FACTORY_ROUTINE_ID_REVIEWER: ${{ vars.FACTORY_ROUTINE_ID_REVIEWER }}
+          FACTORY_FIRE_TOKEN_REVIEWER: ${{ secrets.FACTORY_FIRE_TOKEN_REVIEWER }}

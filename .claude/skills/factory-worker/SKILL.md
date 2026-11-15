@@ -21,17 +21,20 @@ Run this check at the start, before every `git push`, and before opening the pul
 1. Read the issue with `gh api repos/{owner}/{repo}/issues/<n>` and run the assignment check. The title starts with the task id, for example `[G1-T2]`. Read `GOALS.md` for the goal it cites and every file in `docs/decisions/`.
 2. Run `git fetch origin`. Your branch is `factory/<task id>-a<k>`, and only that branch.
    - If it already exists on origin, check it out and continue.
-   - Otherwise, if `k` is greater than 1 and `origin/factory/<task id>-a<k-1>` exists, create your branch from it so earlier work is kept.
+   - Otherwise, if `k` is greater than 1 and `origin/factory/<task id>-a<k-1>` exists, create your branch from it so earlier work is kept, then run `git merge --no-edit origin/main`.
+     The earlier attempt was sent back: read the issue's comments for the reason, and if one names a pull request, read that pull request's comments (`gh api repos/{owner}/{repo}/issues/<pr>/comments`). Fix every point the review raised before anything else.
    - Otherwise create it from `origin/main`.
 3. Write a failing test for each acceptance criterion, then the code that makes it pass.
 4. Commit and push to your branch after each passing step. Unpushed work is lost if the session ends.
 5. Before opening the pull request, run every script that exists: `npm run lint`, `npm run typecheck`, `npm test`, `npm run build`. Fix failures.
 6. If no pull request exists for your branch, open one with `gh api repos/{owner}/{repo}/pulls` (title = the issue title, base `main`, body = what changed, how each acceptance criterion is tested, and `Closes #<n>`).
-7. Stop. If you are later woken because a check failed on this pull request, run the assignment check, then fix it on the same branch and push.
+7. Stop. A separate reviewer session checks the pull request, and the factory merges it if every check passes. If you are later woken because a check failed on this pull request, run the assignment check, then fix it on the same branch and push.
 
 ## Rules
 
 - Never edit `GOALS.md`, `.github/**` or `.claude/**`. If the task cannot be done without that, comment on the issue explaining why and stop.
+- A pull request is never merged automatically if it touches secrets or `.env` files, Dockerfiles, deployment or infrastructure configuration, or database migrations, or if it removes a `lint`, `typecheck`, `test` or `build` script or deletes test files. Avoid those unless the task requires them; a person will then have to merge it.
+- Never write a review verdict or the text `factory-review` anywhere.
 - Never push to `main` or to any branch but your own, never force push, never merge, never change labels, never open or close issues.
 - Use `gh api` REST calls only. `gh pr` and `gh issue` do not work here.
 - Do only what the issue asks. Put other ideas in a comment on the issue.

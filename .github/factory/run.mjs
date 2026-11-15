@@ -1,6 +1,6 @@
 import {
   decide, parseGoalIds, parseMeta, withMeta, renderIssue, taskHash,
-  stateOf, touchesProtected, ciState, branchOf, fireOutcome, STATES, BRANCH,
+  stateOf, touchesProtected, ciState, branchOf, fireOutcome, pickReview, weakened, STATES, BRANCH,
 } from './lib.mjs';
 
 const { GITHUB_TOKEN, GITHUB_REPOSITORY: REPO } = process.env;
@@ -8,7 +8,7 @@ const r = `/repos/${REPO}`;
 const LABELS = [...STATES, 'superseded', 'factory-task', 'factory-status'];
 
 // Model routing: a routine runs one model, so each route may name its own
-// routine (FACTORY_ROUTINE_ID_PLANNER, _WORKER, _ESCALATION and the matching
+// routine (FACTORY_ROUTINE_ID_PLANNER, _WORKER, _ESCALATION, _REVIEWER and the matching
 // FACTORY_FIRE_TOKEN_*). Unset routes fall back to the base pair.
 function routine(route) {
   const R = route.toUpperCase();
@@ -45,13 +45,26 @@ async function file(path, ref) {
 
 const ciOf = async (sha) => ciState((await gh('GET', `${r}/commits/${sha}/check-runs?per_page=100`))?.check_runs ?? []);
 
-async function prDetails(p) {
-  const files = (await all(`${r}/pulls/${p.number}/files`)).map((f) => f.filename);
+async function scripts(ref) {
+  try { return JSON.parse((await file('package.json', ref)) ?? '{}').scripts ?? {}; } catch { return {}; }
+}
+
+// Everything the merge decision needs, read fresh for one commit of one PR.
+async function prDetails(number) {
+  const p = await gh('GET', `${r}/pulls/${number}`);
+  const sha = p.head.sha;
+  const files = await all(`${r}/pulls/${number}/files`);
+  const cmp = await gh('GET', `${r}/compare/main...${sha}`);
   return {
-    number: p.number,
+    number,
     state: p.merged_at ? 'merged' : p.state,
-    ci: await ciOf(p.head.sha),
-    protectedFiles: touchesProtected(files),
+    headSha: sha,
+    ci: await ciOf(sha),
+    files: files.length,
+    protectedFiles: touchesProtected(files.flatMap((f) => [f.filename, f.previous_filename].filter(Boolean))),
+    weakened: weakened(files, await scripts('main'), await scripts(sha)),
+    mergeable: p.mergeable,
+    behind: !cmp || cmp.behind_by > 0, // CI ran on this tree only if nothing landed on main since
   };
 }
 
@@ -74,7 +87,7 @@ async function loadState() {
 
   // Factory PRs grouped by task id; newest first within a task.
   const prsById = new Map();
-  for (const p of (await all(`${r}/pulls?state=all&sort=created&direction=desc`)).filter((x) => x.head.repo?.full_name === REPO)) {
+  for (const p of (await all(`${r}/pulls?state=all&sort=created&direction=desc`)).filter((x) => x.head.repo?.full_name === REPO && x.base.ref === 'main')) {
     const m = BRANCH.exec(p.head.ref);
     if (m) prsById.set(m[1], [...(prsById.get(m[1]) ?? []), { ...p, attempt: Number(m[2]) }]);
   }
@@ -90,9 +103,10 @@ async function loadState() {
       pr: null, lastCommitAt: 0,
     };
     const st = issue.open ? stateOf(issue) : null;
-    if (st === 'in-progress' || st === 'awaiting-merge') {
+    if (st === 'in-progress' || st === 'in-review') {
       const current = prs.find((p) => p.attempt === meta.attempt);
-      if (current) issue.pr = await prDetails(current);
+      if (current) issue.pr = await prDetails(current.number);
+      if (current && st === 'in-review') issue.review = pickReview(await all(`${r}/issues/${current.number}/comments`));
       const branch = await gh('GET', `${r}/branches/${encodeURIComponent(branchOf(meta.id, meta.attempt))}`);
       if (branch) issue.lastCommitAt = Date.parse(branch.commit.commit.committer.date);
     }
@@ -164,6 +178,18 @@ async function apply(a, s, notes) {
       await gh('PATCH', `${r}/pulls/${a.number}`, { state: 'closed' });
       await gh('POST', `${r}/issues/${a.number}/comments`, { body: `Factory: closed because issue #${a.issue} is no longer assigned to this attempt.` });
       return false;
+    case 'merge': {
+      // GitHub merges only if the head is still exactly the validated commit.
+      const task = s.issues.find((i) => i.number === a.issue);
+      try {
+        await gh('PUT', `${r}/pulls/${a.number}/merge`, { sha: a.sha, merge_method: 'squash' });
+        await gh('POST', `${r}/issues/${a.issue}/comments`, { body: `Factory: merged #${a.number} at \`${a.sha}\`.` });
+      } catch (e) {
+        await setState(task, 'needs-human');
+        await gh('POST', `${r}/issues/${a.issue}/comments`, { body: `Factory: moved to \`needs-human\` (merge of #${a.number} at \`${a.sha}\` refused: ${e.message.slice(0, 300)}).` });
+      }
+      return false;
+    }
     case 'state':
       await setState(issue, a.to, a.meta);
       if (a.reason) await gh('POST', `${r}/issues/${a.number}/comments`, { body: `Factory: moved to \`${a.to}\` (${a.reason}).` });
@@ -184,8 +210,20 @@ async function apply(a, s, notes) {
         } else s.status = { ...s.status, ...fired };
         return true;
       }
+      if (a.role === 'reviewer') {
+        // Only a verdict posted after this moment, for this commit, will count.
+        await setState(issue, 'in-review', { reviewSha: a.sha, reviewAt: Date.now(), reviews: a.reviews });
+        const result = await fire(a.route, `ROLE=reviewer ISSUE=${a.number} PR=${a.pr} SHA=${a.sha}`);
+        if (result === 'refused') {
+          await setState(issue, stateOf(issue)); // roll back: no review spent
+          notes.push(`Reviewer fire refused for #${a.number}. Will retry on the next run.`);
+        } else if (result === 'unknown') {
+          notes.push(`Reviewer fire for #${a.number} got no answer. It is refired if no verdict arrives.`);
+        }
+        return true;
+      }
       // Lease first, so a concurrent reader never sees a session without a lease.
-      await setState(issue, 'in-progress', { attempt: a.attempt, tries: a.tries, leaseAt: s.now });
+      await setState(issue, 'in-progress', { attempt: a.attempt, tries: a.tries, leaseAt: s.now, reviews: 0 });
       const result = await fire(a.route, `ROLE=worker ISSUE=${a.number} ATTEMPT=${a.attempt}`);
       if (result === 'refused') {
         await setState(issue, 'ready'); // roll back: original labels and meta, no attempt spent

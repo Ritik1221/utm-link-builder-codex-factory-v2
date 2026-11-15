@@ -2,11 +2,23 @@ import { createHash } from 'node:crypto';
 
 export const LIMITS = {
   maxTasks: 25, maxAttempts: 3, leaseMs: 90 * 60000, maxLeaseMs: 4 * 60 * 60000,
-  plannerRetryMs: 60 * 60000, maxPlannerFires: 3, maxAwaitingMerge: 2,
+  plannerRetryMs: 60 * 60000, maxPlannerFires: 3,
+  reviewLeaseMs: 45 * 60000, maxReviews: 2, maxFiles: 100,
 };
-export const STATES = ['planned', 'ready', 'in-progress', 'awaiting-merge', 'needs-human'];
+export const STATES = ['planned', 'ready', 'in-progress', 'in-review', 'needs-human'];
 export const BRANCH = /^factory\/(G\d+-T\d+)-a(\d+)$/;
-const PROTECTED = [/^GOALS\.md$/, /^\.github\//, /^\.claude\//];
+// Never merged automatically: the owner's file, the factory itself, secrets,
+// and deployment, infrastructure or database-migration files.
+const PROTECTED = [
+  /^GOALS\.md$/, /^\.github\//, /^\.claude\//, /^CODEOWNERS$/,
+  /(^|\/)\.env(\.(?!example$)[^/]*)?$/, /(^|\/)\.npmrc$/, /\.(pem|key|p12|pfx)$/,
+  /(^|\/)Dockerfile[^/]*$/, /(^|\/)docker-compose[^/]*$/,
+  /(^|\/)(vercel\.json|netlify\.toml|fly\.toml|render\.yaml|wrangler\.toml|Procfile|app\.yaml)$/,
+  /\.tf(vars)?$/, /(^|\/)(infra|deploy|k8s|terraform|helm|migrations)\//,
+];
+const REVIEW = /<!-- factory-review (.*?) -->/s;
+const CI_SCRIPTS = ['lint', 'typecheck', 'test', 'build'];
+const TEST_FILE = /(\.(test|spec)\.[^/]+$)|((^|\/)(__tests__|tests?)\/)/;
 const ID = /^G\d+-T\d+$/;
 const MARK = /<!-- factory-meta (.*?) -->/s;
 
@@ -25,6 +37,28 @@ export const taskHash = (t) =>
 // a 5xx or no answer at all may still have started one.
 export const fireOutcome = (status) =>
   status >= 200 && status < 300 ? 'ok' : status >= 400 && status < 500 ? 'refused' : 'unknown';
+
+// The newest review verdict among a PR's comments (oldest first), or null.
+export function pickReview(comments) {
+  for (const c of [...comments].reverse()) {
+    const m = REVIEW.exec(c.body ?? '');
+    if (!m) continue;
+    try {
+      const v = JSON.parse(m[1]);
+      if (typeof v.sha === 'string' && ['approve', 'reject'].includes(v.verdict)) return { sha: v.sha, verdict: v.verdict, at: Date.parse(c.created_at) };
+    } catch { /* not a verdict */ }
+  }
+  return null;
+}
+
+// A reason when a PR makes CI prove less than it did on main, else null.
+// files: [{ filename, status }]; scripts: the package.json "scripts" on main and on the PR head.
+export function weakened(files, baseScripts, headScripts) {
+  const gone = CI_SCRIPTS.filter((k) => baseScripts?.[k] && !headScripts?.[k]?.trim());
+  if (gone.length) return `PR removes the CI script: ${gone.join(', ')}`;
+  if (files.some((f) => f.status === 'removed' && TEST_FILE.test(f.filename))) return 'PR deletes tests';
+  return null;
+}
 
 export function parseMeta(body) {
   const m = MARK.exec(body ?? '');
@@ -45,7 +79,8 @@ export function renderIssue(t, meta) {
 }
 
 export function ciState(checkRuns) {
-  const runs = checkRuns.filter((c) => c.name === 'ci')
+  // Only a run reported by GitHub Actions counts; no other identity can vouch for CI.
+  const runs = checkRuns.filter((c) => c.name === 'ci' && c.app?.slug === 'github-actions')
     .sort((a, b) => Date.parse(b.started_at) - Date.parse(a.started_at));
   if (!runs.length || runs[0].status !== 'completed') return 'pending';
   return runs[0].conclusion === 'success' ? 'green' : 'red';
@@ -87,7 +122,7 @@ function stalePrs(i) {
   const st = i.open ? stateOf(i) : null;
   const prs = i.openPrs ?? [];
   if (i.open && (st === null || st === 'needs-human')) return [];
-  if (st === 'in-progress' || st === 'awaiting-merge') return prs.filter((p) => p.attempt !== i.meta.attempt);
+  if (st === 'in-progress' || st === 'in-review') return prs.filter((p) => p.attempt !== i.meta.attempt);
   return prs;
 }
 
@@ -129,13 +164,39 @@ export function decide(s) {
       continue;
     }
     for (const p of stalePrs(i)) moves.push({ type: 'closePr', number: p.number, issue: i.number });
-    if (st === 'in-progress' || st === 'awaiting-merge') {
-      const lease = i.meta.leaseAt ?? 0;
+    if (st === 'in-progress' || st === 'in-review') {
+      const m = i.meta;
+      const lease = m.leaseAt ?? 0;
+      const review = () => {
+        if ((m.reviews ?? 0) >= LIMITS.maxReviews) to('needs-human', 'review limit reached');
+        else moves.push({ type: 'fire', role: 'reviewer', number: i.number, pr: pr.number, sha: pr.headSha, reviews: (m.reviews ?? 0) + 1, route: 'reviewer' });
+      };
+      // Back to the worker with a fresh lease, so its fix is not cut short.
+      const back = (reason) => moves.push({ type: 'state', number: i.number, to: 'in-progress', reason, meta: { leaseAt: s.now } });
       if (pr?.state === 'merged') moves.push({ type: 'close', number: i.number });
       else if (pr?.protectedFiles) to('needs-human', 'PR touches protected paths');
-      else if (st === 'in-progress' && pr?.state === 'open' && pr.ci === 'green') to('awaiting-merge');
-      else if (st === 'awaiting-merge' && (pr?.state !== 'open' || pr.ci === 'red')) to('ready', 'PR closed or CI red');
-      else if (st === 'in-progress' && (s.now - Math.max(lease, i.lastCommitAt ?? 0) > LIMITS.leaseMs || s.now - lease > LIMITS.maxLeaseMs)) to('ready', 'lease expired');
+      else if (pr?.weakened) to('needs-human', pr.weakened);
+      else if (pr && pr.files > LIMITS.maxFiles) to('needs-human', 'PR too large to validate');
+      else if (st === 'in-progress') {
+        if (pr?.state === 'open' && pr.ci === 'green') review();
+        else if (s.now - Math.max(lease, i.lastCommitAt ?? 0) > LIMITS.leaseMs || s.now - lease > LIMITS.maxLeaseMs) to('ready', 'lease expired');
+      } else if (pr?.state !== 'open') to('ready', 'PR closed');
+      else if (pr.headSha !== m.reviewSha) back('commits changed during review');
+      else if (pr.ci === 'red') back('CI red');
+      else {
+        // A verdict counts only for the commit under review and only if it was
+        // posted after this review began. Approval alone merges nothing: CI,
+        // paths, size, conflicts and freshness were all checked above or below,
+        // by this code, on that same commit.
+        const v = i.review && i.review.sha === pr.headSha && i.review.at > (m.reviewAt ?? 0) ? i.review.verdict : null;
+        if (v === 'reject') to('ready', `review rejected, see #${pr.number}`);
+        else if (v === 'approve') {
+          if (pr.ci !== 'green' || pr.mergeable === null) { /* wait for CI or GitHub */ }
+          else if (pr.behind) to('ready', 'branch is behind main');
+          else if (!pr.mergeable) to('ready', 'merge conflict');
+          else moves.push({ type: 'merge', number: pr.number, issue: i.number, sha: pr.headSha });
+        } else if (s.now - (m.reviewAt ?? 0) > LIMITS.reviewLeaseMs) review();
+      }
     } else if (st === 'planned') {
       const t = taskById.get(i.meta.id);
       if (t && t.depends_on.every((d) => done.has(d))) to('ready');
@@ -145,7 +206,7 @@ export function decide(s) {
 
   if (!s.goalIds.length) return [{ type: 'note', text: 'GOALS.md has no "## G<n>: title" headings. Nothing to plan.' }];
   const notes = planErrors.length ? [{ type: 'note', text: `Plan rejected: ${planErrors.join('; ')}` }] : [];
-  if (open.some((i) => stateOf(i) === 'in-progress')) return notes;
+  if (open.some((i) => ['in-progress', 'in-review'].includes(stateOf(i)))) return notes;
   if (!planOk) {
     // A missing, outdated or rejected plan: ask the planner again, within its limits.
     const same = s.status.plannerFiredSha === s.goalsSha;
@@ -155,7 +216,6 @@ export function decide(s) {
     return [...notes, { type: 'fire', role: 'planner', sha: s.goalsSha, fires: fires + 1, route: 'planner' }];
   }
   if (s.mainCi === 'red') return [{ type: 'note', text: 'CI is red on main. No new work started.' }];
-  if (open.filter((i) => stateOf(i) === 'awaiting-merge').length >= LIMITS.maxAwaitingMerge) return [];
   const next = s.plan.tasks.map((t) => open.find((i) => i.meta.id === t.id)).find((i) => i && stateOf(i) === 'ready');
   if (next) {
     // attempt only ever grows (it names the branch); tries counts toward the limit.
