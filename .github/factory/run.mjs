@@ -55,11 +55,15 @@ async function prDetails(p) {
   };
 }
 
+let statusNumber = null;
 async function loadStatus() {
   // The oldest status issue is the one; reopen it rather than lose the planner counters.
-  let [s] = await gh('GET', `${r}/issues?state=all&labels=factory-status&sort=created&direction=asc&per_page=1`);
+  // Looked up by number after the first time: the issue list lags behind a create.
+  let s = statusNumber ? await gh('GET', `${r}/issues/${statusNumber}`)
+    : (await gh('GET', `${r}/issues?state=all&labels=factory-status&sort=created&direction=asc&per_page=1`))[0];
   if (!s) s = await gh('POST', `${r}/issues`, { title: 'Factory status', body: withMeta('Starting.', {}), labels: ['factory-status'] });
   else if (s.state !== 'open') await gh('PATCH', `${r}/issues/${s.number}`, { state: 'open' });
+  statusNumber = s.number;
   return { number: s.number, body: s.body, plannerFiredSha: null, plannerFiredAt: 0, plannerFires: 0, ...parseMeta(s.body) };
 }
 
