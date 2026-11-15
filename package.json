@@ -1,5 +1,6 @@
 {
   "name": "factory-trial",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
   "scripts": { "start": "node src/server.mjs", "test": "node --test src/*.test.mjs" }
