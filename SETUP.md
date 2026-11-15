@@ -20,7 +20,12 @@
        gh secret set FACTORY_FIRE_TOKEN
 
 4. With GitHub Pro: add a ruleset on `main` requiring a pull request and the `ci` check.
+   Also move the fire-token secrets into an environment limited to `main` and add
+   `environment: <name>` to the `dispatch` job. Until then, a workflow file pushed
+   to any branch could read them; the agent hook discourages that but cannot prevent it.
 5. Write your goals in `GOALS.md` and push to `main`. Watch the issue named "Factory status".
+
+If an issue lands in `needs-human`, read its last comment, fix the cause, and set its label back to `ready`; it gets a fresh set of tries.
 
 To stop everything: pause the routine. To resume: re-enable it and run the `factory` workflow manually.
 

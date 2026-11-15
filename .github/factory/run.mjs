@@ -1,6 +1,6 @@
 import {
   decide, parseGoalIds, parseMeta, withMeta, renderIssue, taskHash,
-  stateOf, touchesProtected, ciState, branchOf, STATES, BRANCH,
+  stateOf, touchesProtected, ciState, branchOf, fireOutcome, STATES, BRANCH,
 } from './lib.mjs';
 
 const { GITHUB_TOKEN, GITHUB_REPOSITORY: REPO } = process.env;
@@ -56,9 +56,11 @@ async function prDetails(p) {
 }
 
 async function loadStatus() {
-  let [s] = await gh('GET', `${r}/issues?state=open&labels=factory-status&per_page=1`);
+  // The oldest status issue is the one; reopen it rather than lose the planner counters.
+  let [s] = await gh('GET', `${r}/issues?state=all&labels=factory-status&sort=created&direction=asc&per_page=1`);
   if (!s) s = await gh('POST', `${r}/issues`, { title: 'Factory status', body: withMeta('Starting.', {}), labels: ['factory-status'] });
-  return { number: s.number, plannerFiredSha: null, plannerFiredAt: 0, plannerFires: 0, ...parseMeta(s.body) };
+  else if (s.state !== 'open') await gh('PATCH', `${r}/issues/${s.number}`, { state: 'open' });
+  return { number: s.number, body: s.body, plannerFiredSha: null, plannerFiredAt: 0, plannerFires: 0, ...parseMeta(s.body) };
 }
 
 async function loadState() {
@@ -106,8 +108,11 @@ async function setState(issue, to, metaPatch = {}) {
   await gh('PATCH', `${r}/issues/${issue.number}`, { labels, body: withMeta(issue.body, { ...issue.meta, ...metaPatch }) });
 }
 
-// 'ok': a session started. 'refused': the API answered and no session exists.
-// 'unknown': no answer, so a session may or may not have started.
+const planner = ({ plannerFiredSha, plannerFiredAt, plannerFires }) => ({ plannerFiredSha, plannerFiredAt, plannerFires });
+const saveStatus = (status, meta) => gh('PATCH', `${r}/issues/${status.number}`, { body: withMeta(status.body, meta) });
+
+// 'ok': a session started. 'refused': a 4xx, so no session exists.
+// 'unknown': a 5xx or no answer, so a session may or may not have started.
 async function fire(route, text) {
   const { id, token } = routine(route);
   if (!id || !token) { console.log(`fire "${text}" (${route}) -> no routine configured`); return 'refused'; }
@@ -124,7 +129,7 @@ async function fire(route, text) {
       signal: AbortSignal.timeout(60000),
     });
     console.log(`fire "${text}" (${route}) -> HTTP ${res.status}`);
-    return res.ok ? 'ok' : 'refused';
+    return fireOutcome(res.status);
   } catch (e) {
     console.log(`fire "${text}" (${route}) -> ${e.name}`);
     return 'unknown';
@@ -152,11 +157,11 @@ async function apply(a, s, notes) {
       await gh('PATCH', `${r}/issues/${a.number}`, { state: 'closed' });
       return false;
     case 'closePr':
-      await gh('POST', `${r}/issues/${a.number}/comments`, { body: `Factory: closed because issue #${a.issue} is no longer assigned to this attempt.` });
       await gh('PATCH', `${r}/pulls/${a.number}`, { state: 'closed' });
+      await gh('POST', `${r}/issues/${a.number}/comments`, { body: `Factory: closed because issue #${a.issue} is no longer assigned to this attempt.` });
       return false;
     case 'state':
-      await setState(issue, a.to);
+      await setState(issue, a.to, a.meta);
       if (a.reason) await gh('POST', `${r}/issues/${a.number}/comments`, { body: `Factory: moved to \`${a.to}\` (${a.reason}).` });
       return false;
     case 'note':
@@ -164,13 +169,19 @@ async function apply(a, s, notes) {
       return true;
     case 'fire': {
       if (a.role === 'planner') {
+        // Record first, so a crash after the call can never hide a fire.
         // An unanswered fire counts as a fire: the session may exist.
-        if ((await fire(a.route, `ROLE=planner SHA=${a.sha}`)) !== 'refused') s.status = { ...s.status, plannerFiredSha: a.sha, plannerFiredAt: s.now, plannerFires: a.fires };
-        else notes.push('Planner fire refused. Will retry on the next run.');
+        const before = planner(s.status);
+        const fired = { plannerFiredSha: a.sha, plannerFiredAt: s.now, plannerFires: a.fires };
+        await saveStatus(s.status, fired);
+        if ((await fire(a.route, `ROLE=planner SHA=${a.sha}`)) === 'refused') {
+          await saveStatus(s.status, before);
+          notes.push('Planner fire refused. Will retry on the next run.');
+        } else s.status = { ...s.status, ...fired };
         return true;
       }
       // Lease first, so a concurrent reader never sees a session without a lease.
-      await setState(issue, 'in-progress', { attempt: a.attempt, leaseAt: s.now });
+      await setState(issue, 'in-progress', { attempt: a.attempt, tries: a.tries, leaseAt: s.now });
       const result = await fire(a.route, `ROLE=worker ISSUE=${a.number} ATTEMPT=${a.attempt}`);
       if (result === 'refused') {
         await setState(issue, 'ready'); // roll back: original labels and meta, no attempt spent
@@ -185,16 +196,15 @@ async function apply(a, s, notes) {
   }
 }
 
-async function writeStatus(planner, notes) {
+async function writeStatus(status, notes) {
   const s = await loadState();
-  const rows = s.issues.map((i) => `| #${i.number} | ${i.meta.id} | ${i.open ? stateOf(i) : i.labels.includes('superseded') ? 'superseded' : 'done'} | ${i.meta.attempt ?? 0} | ${i.pr ? `#${i.pr.number} (${i.pr.ci})` : ''} |`);
+  const rows = s.issues.map((i) => `| #${i.number} | ${i.meta.id} | ${i.open ? stateOf(i) : i.labels.includes('superseded') ? 'superseded' : 'done'} | ${i.meta.tries ?? 0} | ${i.pr ? `#${i.pr.number} (${i.pr.ci})` : ''} |`);
   const body = [
     `Updated ${new Date(s.now).toISOString()}. GOALS.md at \`${s.goalsSha}\`, plan at \`${s.plan?.goals_sha ?? 'none'}\`.`, '',
     ...(notes.length ? ['**Notes**', ...notes.map((n) => `- ${n}`), ''] : []),
-    '| Issue | Task | State | Attempts | PR |', '|---|---|---|---|---|', ...rows,
+    '| Issue | Task | State | Tries | PR |', '|---|---|---|---|---|', ...rows,
   ].join('\n');
-  const { plannerFiredSha, plannerFiredAt, plannerFires } = planner;
-  await gh('PATCH', `${r}/issues/${s.status.number}`, { body: withMeta(body, { plannerFiredSha, plannerFiredAt, plannerFires }) });
+  await gh('PATCH', `${r}/issues/${s.status.number}`, { body: withMeta(body, planner(status)) });
 }
 
 for (const name of LABELS) await gh('POST', `${r}/labels`, { name });

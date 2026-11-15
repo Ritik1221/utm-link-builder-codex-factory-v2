@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   decide, validatePlan, taskHash, parseGoalIds, parseMeta, withMeta,
-  renderIssue, touchesProtected, ciState, branchOf, LIMITS,
+  renderIssue, touchesProtected, ciState, branchOf, fireOutcome, LIMITS,
 } from './lib.mjs';
 
 const T1 = { id: 'G1-T1', goal: 'G1', title: 'Scaffold', acceptance: ['npm test passes'], depends_on: [] };
@@ -82,8 +82,9 @@ test('planner waits while a worker is in progress', () => {
 
 test('unparseable or invalid plan creates nothing', () => {
   const a = decide(state({ plan: { goals_sha: 'abc', tasks: null } }));
-  assert.equal(a.length, 1);
+  assert.deepEqual(a.map((x) => x.type), ['note', 'fire']);
   assert.match(a[0].text, /Plan rejected/);
+  assert.equal(a[1].role, 'planner');
 });
 
 test('sync creates each missing task once', () => {
@@ -112,12 +113,13 @@ test('planned becomes ready only when dependencies are closed and not superseded
   const done = [issue(T1, 2, 'awaiting-merge', { open: false }), issue(T2, 3, 'planned')];
   assert.deepEqual(decide(state({ issues: done })), [{ type: 'state', number: 3, to: 'ready', reason: undefined }]);
   const superseded = [issue(T1, 2, 'superseded', { open: false }), issue(T2, 3, 'planned')];
-  assert.deepEqual(decide(state({ issues: superseded })), []);
+  // the superseded task is recreated first; its dependant stays planned
+  assert.deepEqual(decide(state({ issues: superseded })), [{ type: 'create', task: T1 }]);
 });
 
 test('fires one worker when nothing is in progress, none when something is', () => {
   const ready = [issue(T1, 2, 'ready'), issue(T2, 3, 'planned')];
-  assert.deepEqual(decide(state({ issues: ready })), [{ type: 'fire', role: 'worker', number: 2, attempt: 1, route: 'worker' }]);
+  assert.deepEqual(decide(state({ issues: ready })), [{ type: 'fire', role: 'worker', number: 2, attempt: 1, tries: 1, route: 'worker' }]);
   const lease = { meta: { id: 'G1-T1', hash: taskHash(T1), attempt: 1, leaseAt: NOW - 60000 } };
   assert.deepEqual(decide(state({ issues: [issue(T1, 2, 'in-progress', lease), issue(T2, 3, 'planned')] })), []);
   const T3 = { ...T1, id: 'G1-T3' };
@@ -137,9 +139,10 @@ test('in-progress transitions', () => {
 });
 
 test('a ready task with attempts exhausted needs a human', () => {
-  const spent = issue(T1, 2, 'ready', { meta: { id: 'G1-T1', hash: taskHash(T1), attempt: LIMITS.maxAttempts } });
+  const spent = issue(T1, 2, 'ready', { meta: { id: 'G1-T1', hash: taskHash(T1), attempt: 3, tries: LIMITS.maxAttempts } });
   const a = decide(state({ plan: { goals_sha: 'abc', tasks: [T1] }, issues: [spent] }));
   assert.equal(a[0].to, 'needs-human');
+  assert.deepEqual(a[0].meta, { tries: 0 }); // the owner relabelling to ready grants a fresh set of tries
 });
 
 test('awaiting-merge: closed PR returns to ready, merged PR closes the issue', () => {
@@ -173,10 +176,10 @@ test('difficulty is optional but must be routine or hard', () => {
 test('hard tasks and the last attempt are routed to escalation', () => {
   const hard = { ...T1, difficulty: 'hard' };
   const a = decide(state({ plan: { goals_sha: 'abc', tasks: [hard] }, issues: [issue(hard, 2, 'ready')] }));
-  assert.deepEqual(a, [{ type: 'fire', role: 'worker', number: 2, attempt: 1, route: 'escalation' }]);
-  const last = issue(T1, 2, 'ready', { meta: { id: 'G1-T1', hash: taskHash(T1), attempt: LIMITS.maxAttempts - 1 } });
+  assert.deepEqual(a, [{ type: 'fire', role: 'worker', number: 2, attempt: 1, tries: 1, route: 'escalation' }]);
+  const last = issue(T1, 2, 'ready', { meta: { id: 'G1-T1', hash: taskHash(T1), attempt: 7, tries: LIMITS.maxAttempts - 1 } });
   const b = decide(state({ plan: { goals_sha: 'abc', tasks: [T1] }, issues: [last] }));
-  assert.deepEqual(b, [{ type: 'fire', role: 'worker', number: 2, attempt: LIMITS.maxAttempts, route: 'escalation' }]);
+  assert.deepEqual(b, [{ type: 'fire', role: 'worker', number: 2, attempt: 8, tries: LIMITS.maxAttempts, route: 'escalation' }]);
 });
 
 test('PRs from other attempts are closed; the current attempt and needs-human are left alone', () => {
@@ -192,8 +195,44 @@ test('PRs from other attempts are closed; the current attempt and needs-human ar
 });
 
 test('an exhausted ready task keeps its PR open for the human', () => {
-  const meta = { id: 'G1-T1', hash: taskHash(T1), attempt: LIMITS.maxAttempts };
+  const meta = { id: 'G1-T1', hash: taskHash(T1), attempt: 3, tries: LIMITS.maxAttempts };
   const a = decide(state({ plan: { goals_sha: 'abc', tasks: [T1] }, issues: [issue(T1, 2, 'ready', { meta, openPrs: [{ number: 7, attempt: 3 }] })] }));
   assert.deepEqual(a.map((x) => x.type), ['state']);
   assert.equal(a[0].to, 'needs-human');
+});
+
+test('fire outcome: only a 4xx proves no session started', () => {
+  assert.equal(fireOutcome(200), 'ok');
+  assert.equal(fireOutcome(401), 'refused');
+  assert.equal(fireOutcome(429), 'refused');
+  assert.equal(fireOutcome(502), 'unknown');
+  assert.equal(fireOutcome(null), 'unknown');
+});
+
+test('a superseded id that returns to the plan gets a new issue', () => {
+  const old = issue(T1, 2, 'superseded', { open: false, labels: ['factory-task', 'superseded'] });
+  const a = decide(state({ plan: { goals_sha: 'abc', tasks: [T1] }, issues: [old] }));
+  assert.deepEqual(a, [{ type: 'create', task: T1 }]);
+});
+
+test('housekeeping continues while the plan is rejected or goals are missing', () => {
+  const merged = issue(T1, 2, 'awaiting-merge', { pr: pr({ state: 'merged' }) });
+  assert.deepEqual(decide(state({ plan: { goals_sha: 'abc', tasks: null }, issues: [merged] })), [{ type: 'close', number: 2 }]);
+  assert.deepEqual(decide(state({ goalIds: [], plan: null, issues: [merged] })), [{ type: 'close', number: 2 }]);
+});
+
+test('a rejected plan stops refiring at the planner cap', () => {
+  const status = { plannerFiredSha: 'abc', plannerFiredAt: NOW - 61 * 60000, plannerFires: LIMITS.maxPlannerFires };
+  const a = decide(state({ plan: { goals_sha: 'abc', tasks: null }, status }));
+  assert.deepEqual(a.map((x) => x.type), ['note', 'note']);
+});
+
+test('an open task with no state label goes to needs-human and keeps its PRs', () => {
+  const odd = { ...issue(T1, 2, 'ready'), labels: ['factory-task'], openPrs: [{ number: 7, attempt: 1 }] };
+  const a = decide(state({ plan: { goals_sha: 'abc', tasks: [T1] }, issues: [odd] }));
+  assert.deepEqual(a.map((x) => [x.type, x.to]), [['state', 'needs-human']]);
+});
+
+test('over-long titles are rejected', () => {
+  assert.ok(validatePlan({ goals_sha: 'abc', tasks: [{ ...T1, title: 'x'.repeat(201) }] }, ['G1']).length > 0);
 });

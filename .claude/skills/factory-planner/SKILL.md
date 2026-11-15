@@ -11,7 +11,7 @@ You plan; you do not build. Your only output is the file `factory/plan.json` on 
 
 1. Read the `SHA=<sha>` value from the payload. Run `git fetch origin` and `git log -1 --format=%H origin/main -- GOALS.md`. If that commit is not the payload SHA, `GOALS.md` has changed since you were started: reply "stale" and stop without changing anything.
 2. Read `GOALS.md` on `origin/main`. Goals are the headings `## G<n>: <title>`.
-3. If `origin/factory/plan` exists, check it out as `factory/plan` and read the existing `factory/plan.json`. Otherwise create `factory/plan` from `origin/main`.
+3. If `origin/factory/plan` exists, check it out as `factory/plan`, run `git merge --no-edit origin/main` so `GOALS.md` and the validator are current, and read the existing `factory/plan.json`. Otherwise create `factory/plan` from `origin/main`.
 4. Write `factory/plan.json`:
 
    ```json

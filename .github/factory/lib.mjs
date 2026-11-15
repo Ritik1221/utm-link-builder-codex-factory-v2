@@ -21,6 +21,11 @@ export const taskHash = (t) =>
     .update(JSON.stringify([t.goal, t.title, t.acceptance, t.depends_on, t.difficulty ?? 'routine']))
     .digest('hex').slice(0, 12);
 
+// What a /fire HTTP status proves. Only a 4xx proves no session was started;
+// a 5xx or no answer at all may still have started one.
+export const fireOutcome = (status) =>
+  status >= 200 && status < 300 ? 'ok' : status >= 400 && status < 500 ? 'refused' : 'unknown';
+
 export function parseMeta(body) {
   const m = MARK.exec(body ?? '');
   try { return m ? JSON.parse(m[1]) : null; } catch { return null; }
@@ -59,7 +64,7 @@ export function validatePlan(plan, goalIds) {
     if (seen.has(id)) errors.push(`duplicate id: ${id}`);
     seen.add(id);
     if (!goalIds.includes(t.goal) || !id.startsWith(`${t.goal}-`)) errors.push(`${id}: goal must be a GOALS.md heading and match the id prefix`);
-    if (typeof t.title !== 'string' || !t.title.trim()) errors.push(`${id}: empty title`);
+    if (typeof t.title !== 'string' || !t.title.trim() || t.title.length > 200) errors.push(`${id}: title must be 1 to 200 characters`);
     if (!Array.isArray(t.acceptance) || !t.acceptance.length || t.acceptance.some((c) => typeof c !== 'string' || !c.trim())) {
       errors.push(`${id}: acceptance must be a non-empty list of non-empty strings`);
     }
@@ -81,7 +86,7 @@ export function validatePlan(plan, goalIds) {
 function stalePrs(i) {
   const st = i.open ? stateOf(i) : null;
   const prs = i.openPrs ?? [];
-  if (st === 'needs-human') return [];
+  if (i.open && (st === null || st === 'needs-human')) return [];
   if (st === 'in-progress' || st === 'awaiting-merge') return prs.filter((p) => p.attempt !== i.meta.attempt);
   return prs;
 }
@@ -89,16 +94,16 @@ function stalePrs(i) {
 // Returns the next batch of actions. The caller applies them, reloads state and
 // calls again until the batch is empty or contains a fire or a note.
 export function decide(s) {
-  if (!s.goalIds.length) return [{ type: 'note', text: 'GOALS.md has no "## G<n>: title" headings. Nothing to plan.' }];
   const open = s.issues.filter((i) => i.open);
+  const live = s.issues.filter((i) => !i.labels.includes('superseded'));
   const planCurrent = !!s.plan && s.plan.goals_sha === s.goalsSha;
+  const planErrors = planCurrent ? validatePlan(s.plan, s.goalIds) : [];
+  const planOk = planCurrent && !planErrors.length && s.goalIds.length > 0;
   const early = ['planned', 'ready'];
 
-  if (planCurrent) {
-    const errors = validatePlan(s.plan, s.goalIds);
-    if (errors.length) return [{ type: 'note', text: `Plan rejected: ${errors.join('; ')}` }];
+  if (planOk) {
     const sync = [];
-    const byId = new Map(s.issues.map((i) => [i.meta.id, i]));
+    const byId = new Map(live.map((i) => [i.meta.id, i]));
     for (const t of s.plan.tasks) {
       const i = byId.get(t.id);
       if (!i) sync.push({ type: 'create', task: t });
@@ -112,13 +117,17 @@ export function decide(s) {
   }
 
   const moves = [];
-  const done = new Set(s.issues.filter((i) => !i.open && !i.labels.includes('superseded')).map((i) => i.meta.id));
-  const taskById = new Map((planCurrent ? s.plan.tasks : []).map((t) => [t.id, t]));
+  const done = new Set(live.filter((i) => !i.open).map((i) => i.meta.id));
+  const taskById = new Map((planOk ? s.plan.tasks : []).map((t) => [t.id, t]));
   for (const i of s.issues) {
     const st = i.open ? stateOf(i) : null;
     const pr = i.pr;
     const to = (state, reason) => moves.push({ type: 'state', number: i.number, to: state, reason });
-    if (st === 'ready' && (i.meta.attempt ?? 0) >= LIMITS.maxAttempts) { to('needs-human', 'attempts exhausted'); continue; }
+    if (i.open && st === null) { to('needs-human', 'no state label'); continue; }
+    if (st === 'ready' && (i.meta.tries ?? 0) >= LIMITS.maxAttempts) {
+      moves.push({ type: 'state', number: i.number, to: 'needs-human', reason: 'attempts exhausted', meta: { tries: 0 } });
+      continue;
+    }
     for (const p of stalePrs(i)) moves.push({ type: 'closePr', number: p.number, issue: i.number });
     if (st === 'in-progress' || st === 'awaiting-merge') {
       const lease = i.meta.leaseAt ?? 0;
@@ -134,21 +143,26 @@ export function decide(s) {
   }
   if (moves.length) return moves;
 
-  if (open.some((i) => stateOf(i) === 'in-progress')) return [];
-  if (!planCurrent) {
+  if (!s.goalIds.length) return [{ type: 'note', text: 'GOALS.md has no "## G<n>: title" headings. Nothing to plan.' }];
+  const notes = planErrors.length ? [{ type: 'note', text: `Plan rejected: ${planErrors.join('; ')}` }] : [];
+  if (open.some((i) => stateOf(i) === 'in-progress')) return notes;
+  if (!planOk) {
+    // A missing, outdated or rejected plan: ask the planner again, within its limits.
     const same = s.status.plannerFiredSha === s.goalsSha;
     const fires = same ? s.status.plannerFires : 0;
-    if (same && s.now - s.status.plannerFiredAt < LIMITS.plannerRetryMs) return [];
-    if (fires >= LIMITS.maxPlannerFires) return [{ type: 'note', text: `Planner produced no plan for ${s.goalsSha} after ${fires} runs. Needs human.` }];
-    return [{ type: 'fire', role: 'planner', sha: s.goalsSha, fires: fires + 1, route: 'planner' }];
+    if (same && s.now - s.status.plannerFiredAt < LIMITS.plannerRetryMs) return notes;
+    if (fires >= LIMITS.maxPlannerFires) return [...notes, { type: 'note', text: `Planner produced no usable plan for ${s.goalsSha} after ${fires} runs. Needs human.` }];
+    return [...notes, { type: 'fire', role: 'planner', sha: s.goalsSha, fires: fires + 1, route: 'planner' }];
   }
   if (s.mainCi === 'red') return [{ type: 'note', text: 'CI is red on main. No new work started.' }];
   if (open.filter((i) => stateOf(i) === 'awaiting-merge').length >= LIMITS.maxAwaitingMerge) return [];
   const next = s.plan.tasks.map((t) => open.find((i) => i.meta.id === t.id)).find((i) => i && stateOf(i) === 'ready');
   if (next) {
+    // attempt only ever grows (it names the branch); tries counts toward the limit.
     const attempt = (next.meta.attempt ?? 0) + 1;
+    const tries = (next.meta.tries ?? 0) + 1;
     const hard = taskById.get(next.meta.id).difficulty === 'hard';
-    return [{ type: 'fire', role: 'worker', number: next.number, attempt, route: hard || attempt >= LIMITS.maxAttempts ? 'escalation' : 'worker' }];
+    return [{ type: 'fire', role: 'worker', number: next.number, attempt, tries, route: hard || tries >= LIMITS.maxAttempts ? 'escalation' : 'worker' }];
   }
   if (s.plan.tasks.every((t) => done.has(t.id))) return [{ type: 'note', text: 'Complete' }];
   return [];
