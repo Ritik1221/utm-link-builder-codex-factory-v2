@@ -19,7 +19,9 @@ if [ "$tool" = "Bash" ]; then
     echo "Writing repository contents, refs or settings through the API is not allowed for agents (guard hook)." >&2
     exit 2
   fi
-  if grep -Eq "(>|tee |sed +-i|perl +-[a-z]*i|(^|[ ;&|])(rm|mv|cp|chmod|touch|truncate|ln) |git +(checkout|restore|apply|rm|mv|stash) ).*$protected" <<<"$cmd"; then
+  # A redirect counts only when the protected path is its target; other commands only
+  # within one simple command, so reading these paths later in the line stays allowed.
+  if grep -Eq "(>>?[ \"']*[^ ;&|<>\"']*|(tee |sed +-i|perl +-[a-z]*i|(^|[ ;&|])(rm|mv|cp|chmod|touch|truncate|ln) |git +(checkout|restore|apply|rm|mv|stash) )[^;&|]*)$protected" <<<"$cmd"; then
     echo "GOALS.md, .github/ and .claude/ are read-only for agents (guard hook)." >&2
     exit 2
   fi

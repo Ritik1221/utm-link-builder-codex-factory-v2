@@ -25,4 +25,18 @@ t 0 '{"tool_name":"Bash","tool_input":{"command":"git checkout -b factory/G1-T1-
 t 0 '{"tool_name":"Bash","tool_input":{"command":"node -e \"import(\u0027./.github/factory/lib.mjs\u0027)\""}}'
 t 0 '{"tool_name":"Bash","tool_input":{"command":"git push -u origin factory/G1-T1-a1"}}'
 t 0 '{"tool_name":"Bash","tool_input":{"command":"git fetch origin main && npm test"}}'
+# Commands the first live planner session ran; reading protected paths must stay possible.
+b() { t "$1" "$(jq -nc --arg c "$2" '{tool_name:"Bash",tool_input:{command:$c}}')"; }
+b 0 'git fetch origin 2>&1 | tail -2; git log -1 --format=%H origin/main -- GOALS.md; git branch -r; cat GOALS.md; ls'
+b 0 "node -e \"import('./.github/factory/lib.mjs').then(async (m) => { const fs = await import('node:fs'); const e = m.validatePlan(JSON.parse(fs.readFileSync('factory/plan.json', 'utf8')), m.parseGoalIds(fs.readFileSync('GOALS.md', 'utf8'))); console.log(e.length ? e.join('\\n') : 'valid'); process.exit(e.length ? 1 : 0); })\""
+b 0 'git checkout -B factory/plan origin/factory/plan 2>&1|tail -1; git merge --no-edit origin/main 2>&1|tail -1; cat GOALS.md'
+b 0 'git checkout --detach abc123 && git diff origin/main...abc123 > /tmp/d.txt; cat GOALS.md .claude/skills/factory-reviewer/SKILL.md'
+b 0 'rm -rf node_modules; npm ci; cat .github/workflows/ci.yml'
+b 0 "gh api repos/o/r/issues/5/comments -f body='Reads GOALS.md fine. <!-- factory-review {\"sha\":\"abc\",\"verdict\":\"approve\"} -->'"
+b 2 'echo x >> ./GOALS.md'
+b 2 'cat a.yml > ".github/workflows/x.yml"'
+b 2 'echo x | tee -a .claude/settings.json'
+b 2 'npm test; rm -rf .github/workflows'
+b 2 'git checkout origin/factory/G1-T1-a1 -- .claude/hooks/guard.sh'
+b 2 'cp evil.yml .github/workflows/evil.yml && git add -A'
 exit $fail
