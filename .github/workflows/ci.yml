@@ -16,6 +16,7 @@ jobs:
           node-version: 22
       - run: node --test .github/factory/*.test.mjs
       - run: node .github/factory/scan.mjs
+      - run: bash .claude/hooks/guard.test.sh
       - if: hashFiles('package.json') != ''
         run: |
           if [ -f package-lock.json ]; then npm ci && npm audit --audit-level=high; else npm install --no-audit --no-fund; fi
