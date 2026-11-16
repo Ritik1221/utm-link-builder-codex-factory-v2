@@ -1,0 +1,5 @@
+{
+  "completion_contract": 1,
+  "e2e_check": "e2e",
+  "note": "The e2e script must exercise a real product behavior and assert an observable result."
+}

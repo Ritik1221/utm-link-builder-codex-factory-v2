@@ -1,9 +1,15 @@
 ---
 name: factory-worker
-description: Use when the routine payload contains ROLE=worker. Implements one factory issue as one pull request.
+description: Use when the routine payload contains ROLE=worker or ROLE=corrective-worker. Implements one factory issue as one pull request.
 ---
 
 # Factory worker
+
+The provider-neutral contract in `.github/factory/roles/worker.md` is authoritative for permissions and outputs. A `corrective-worker` follows the same contract but must satisfy every linked finding and corrective acceptance test.
+
+## Model check
+
+The payload names `EXPECTED_MODEL=opus` or `EXPECTED_MODEL=sonnet`. If you are not a Claude model of that family, reply "wrong model: expected <family>, running <your model id>" and stop without touching the repository. Otherwise write `Model: <your exact model id>` in the pull request body.
 
 You implement exactly one issue, named by `ISSUE=<n> ATTEMPT=<k>` in the payload, as one pull request.
 
@@ -18,11 +24,11 @@ Run this check at the start, before every `git push`, and before opening the pul
 
 ## Steps
 
-1. Read the issue with `gh api repos/{owner}/{repo}/issues/<n>` and run the assignment check. The title starts with the task id, for example `[G1-T2]`. Read `GOALS.md` for the goal it cites and every file in `docs/decisions/`.
+1. Read the issue with `gh api repos/{owner}/{repo}/issues/<n>` and run the assignment check. The title starts with the task id, for example `[G1-T2]`. Read the immutable goal version named in the issue, the plan requirements mapped to this task, and every file in `docs/decisions/`.
 2. Run `git fetch origin`. Your branch is `factory/<task id>-a<k>`, and only that branch.
    - If it already exists on origin, check it out and continue.
    - Otherwise, if `k` is greater than 1 and `origin/factory/<task id>-a<k-1>` exists, create your branch from it so earlier work is kept, then run `git merge --no-edit origin/main`.
-     The earlier attempt was sent back: read the issue's comments for the reason, and if one names a pull request, read that pull request's comments (`gh api repos/{owner}/{repo}/issues/<pr>/comments`). Fix every point the review raised before anything else.
+     The earlier attempt was sent back: read the structured review findings in the issue metadata and comments, and if one names a pull request, read that pull request's comments (`gh api repos/{owner}/{repo}/issues/<pr>/comments`). Fix every blocking or major finding and add the required corrective tests before anything else.
    - Otherwise create it from `origin/main`.
 3. Write a failing test for each acceptance criterion, then the code that makes it pass.
 4. Commit and push to your branch after each passing step. Unpushed work is lost if the session ends.

@@ -6,6 +6,8 @@ on:
     paths: [GOALS.md]
   issue_comment:
     types: [created]
+  issues:
+    types: [opened, labeled, edited]
   workflow_run:
     workflows: [ci]
     types: [completed]
@@ -14,6 +16,17 @@ on:
   schedule:
     - cron: '17 * * * *'
   workflow_dispatch:
+    inputs:
+      fault_point:
+        description: Disposable Stage A crash point; leave as none for normal operation
+        required: false
+        default: none
+        type: choice
+        options:
+          - none
+          - after-journal-append
+          - after-task-operation-intent
+          - after-task-issue-create
 concurrency:
   group: factory
   cancel-in-progress: false
@@ -23,20 +36,37 @@ permissions:
   issues: write
   pull-requests: write
   checks: read
+  actions: write
 jobs:
   dispatch:
+    # Fire tokens are secrets of this environment, which deploys only from
+    # main, so a workflow pushed to any other branch cannot read them.
+    environment: factory
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: main
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
       - run: node .github/factory/run.mjs
         env:
+          # The ephemeral token is scoped to this repository and this job.
+          # Follow-up workflows are dispatched explicitly when needed; never
+          # store a broad personal token in a disposable or product repository.
           GITHUB_TOKEN: ${{ github.token }}
+          # One Claude routine per model; planner, escalation and final review
+          # use Opus, worker and task review use Sonnet. Older explicit routine
+          # pairs remain accepted below for compatibility.
+          FACTORY_ROUTINE_ID_OPUS: ${{ vars.FACTORY_ROUTINE_ID_OPUS }}
+          FACTORY_FIRE_TOKEN_OPUS: ${{ secrets.FACTORY_FIRE_TOKEN_OPUS }}
+          FACTORY_ROUTINE_ID_SONNET: ${{ vars.FACTORY_ROUTINE_ID_SONNET }}
+          FACTORY_FIRE_TOKEN_SONNET: ${{ secrets.FACTORY_FIRE_TOKEN_SONNET }}
+          # Compatibility pairs are considered only when the model-tier pair is
+          # entirely absent. A partially configured higher-priority pair fails
+          # closed instead of silently selecting another routine.
           FACTORY_ROUTINE_ID: ${{ vars.FACTORY_ROUTINE_ID }}
           FACTORY_FIRE_TOKEN: ${{ secrets.FACTORY_FIRE_TOKEN }}
           FACTORY_ROUTINE_ID_PLANNER: ${{ vars.FACTORY_ROUTINE_ID_PLANNER }}
@@ -47,3 +77,20 @@ jobs:
           FACTORY_FIRE_TOKEN_ESCALATION: ${{ secrets.FACTORY_FIRE_TOKEN_ESCALATION }}
           FACTORY_ROUTINE_ID_REVIEWER: ${{ vars.FACTORY_ROUTINE_ID_REVIEWER }}
           FACTORY_FIRE_TOKEN_REVIEWER: ${{ secrets.FACTORY_FIRE_TOKEN_REVIEWER }}
+          FACTORY_ROUTINE_ID_FINAL_REVIEWER: ${{ vars.FACTORY_ROUTINE_ID_FINAL_REVIEWER }}
+          FACTORY_FIRE_TOKEN_FINAL_REVIEWER: ${{ secrets.FACTORY_FIRE_TOKEN_FINAL_REVIEWER }}
+          FACTORY_REVIEWER_LOGIN: ${{ vars.FACTORY_REVIEWER_LOGIN }}
+          FACTORY_WORKER_LOGIN: ${{ vars.FACTORY_WORKER_LOGIN }}
+          FACTORY_OWNER_LOGIN: ${{ vars.FACTORY_OWNER_LOGIN }}
+          FACTORY_ACTIVE_PROVIDER: ${{ vars.FACTORY_ACTIVE_PROVIDER }}
+          FACTORY_CODEX_EXECUTION_MODE: ${{ vars.FACTORY_CODEX_EXECUTION_MODE }}
+          FACTORY_CREDENTIAL_ISOLATED: ${{ vars.FACTORY_CREDENTIAL_ISOLATED }}
+          FACTORY_MAX_INVOCATIONS: ${{ vars.FACTORY_MAX_INVOCATIONS }}
+          FACTORY_MAX_TASKS: ${{ vars.FACTORY_MAX_TASKS }}
+          FACTORY_PROVIDER_RESUME_NONCE: ${{ vars.FACTORY_PROVIDER_RESUME_NONCE }}
+          FACTORY_AGENT_EXECUTION: ${{ vars.FACTORY_AGENT_EXECUTION }}
+          FACTORY_DISPATCHER_LOGIN: ${{ vars.FACTORY_DISPATCHER_LOGIN || 'github-actions[bot]' }}
+          FACTORY_INTEGRATION_TEST: ${{ vars.FACTORY_INTEGRATION_TEST }}
+          FACTORY_INTEGRATION_REPOSITORY: ${{ vars.FACTORY_INTEGRATION_REPOSITORY }}
+          FACTORY_FAULT_POINT: ${{ inputs.fault_point }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}

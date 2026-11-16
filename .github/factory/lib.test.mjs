@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   decide, validatePlan, taskHash, parseGoalIds, parseMeta, withMeta,
-  renderIssue, touchesProtected, ciState, branchOf, fireOutcome, pickReview, weakened, LIMITS,
+  renderIssue, touchesProtected, ciState, branchOf, fireOutcome, pickReview, pickFinalReview, identityBoundaryError, weakened, LIMITS, parseGoalCommand, goalCandidates,
 } from './lib.mjs';
 
 const T1 = { id: 'G1-T1', goal: 'G1', title: 'Scaffold', acceptance: ['npm test passes'], depends_on: [] };
@@ -49,6 +49,9 @@ test('helpers', () => {
   assert.deepEqual(parseMeta(withMeta(body, { id: 'G1-T1', attempt: 3 })), { id: 'G1-T1', attempt: 3 });
   assert.equal(parseMeta('no marker'), null);
   assert.equal(renderIssue(T1, { id: 'G1-T1' }).title, '[G1-T1] Scaffold');
+  assert.deepEqual(parseGoalCommand({ title: '/goal codex Export checker', body: '' }), { provider: 'codex' });
+  assert.deepEqual(parseGoalCommand({ title: 'Export checker', body: '/goal claude\nBuild it' }), { provider: 'claude' });
+  assert.equal(parseGoalCommand({ title: 'ordinary issue', body: 'not a goal' }), null);
   const run = (over) => ({ name: 'ci', app: { slug: 'github-actions' }, status: 'completed', conclusion: 'success', started_at: '2026-01-01T00:00:00Z', ...over });
   assert.equal(ciState([]), 'pending');
   assert.equal(ciState([run({ name: 'vercel', conclusion: 'failure' })]), 'pending');
@@ -56,6 +59,16 @@ test('helpers', () => {
   assert.equal(ciState([run({ app: { slug: 'some-other-app' } })]), 'pending'); // only GitHub Actions can vouch for CI
   assert.equal(ciState([run(), run({ conclusion: 'failure', started_at: '2026-01-02T00:00:00Z' })]), 'red');
   assert.equal(ciState([run(), run({ status: 'in_progress', started_at: '2026-01-02T00:00:00Z' })]), 'pending');
+});
+
+test('GitHub Actions checks are evaluated by the requested job name', () => {
+  const checks = [
+    { name: 'ci', status: 'completed', conclusion: 'success', started_at: '2026-01-01T00:00:00Z', app: { slug: 'github-actions' } },
+    { name: 'e2e', status: 'completed', conclusion: 'success', started_at: '2026-01-01T00:00:01Z', app: { slug: 'github-actions' } },
+  ];
+  assert.equal(ciState(checks), 'green');
+  assert.equal(ciState(checks, 'e2e'), 'green');
+  assert.equal(ciState(checks, 'missing'), 'pending');
 });
 
 test('no goal headings: nothing fired, note explains', () => {
@@ -133,7 +146,8 @@ test('in-progress transitions', () => {
   const one = (extra) => decide(state({ plan: { goals_sha: 'abc', tasks: [T1] }, issues: [issue(T1, 2, 'in-progress', extra)] }));
   assert.deepEqual(one({ ...lease(1000), pr: pr({ ci: 'green' }) }), [{ type: 'fire', role: 'reviewer', number: 2, pr: 9, sha: 'h1', reviews: 1, route: 'reviewer' }]);
   assert.equal(one({ ...lease(1000), pr: pr({ ci: 'green', protectedFiles: true }) })[0].to, 'needs-human');
-  assert.deepEqual(one({ ...lease(1000), pr: pr({ ci: 'red' }) }), []);
+  assert.equal(one({ ...lease(1000), pr: pr({ ci: 'green', unauthorizedAuthor: true }) })[0].to, 'needs-human');
+  assert.equal(one({ ...lease(1000), pr: pr({ ci: 'red' }) })[0].to, 'ready');
   assert.equal(one(lease(LIMITS.leaseMs + 1))[0].to, 'ready');
   assert.deepEqual(one({ ...lease(LIMITS.leaseMs + 1), lastCommitAt: NOW - 1000 }), []);
   assert.equal(one({ ...lease(LIMITS.maxLeaseMs + 1), lastCommitAt: NOW - 1000 })[0].to, 'ready');
@@ -203,16 +217,27 @@ test('no new worker when main is red', () => {
   assert.equal(decide(state({ plan: plan1, issues: [issue(T1, 2, 'ready')], mainCi: 'red' }))[0].type, 'note');
 });
 
+test('missing exact-main checks are explicitly dispatched before more work', () => {
+  const ready = [issue(T1, 2, 'ready'), issue(T2, 3, 'planned')];
+  assert.deepEqual(decide(state({ issues: ready, mainSha: 'main-1', missingMainChecks: ['ci', 'e2e'], mainChecks: { ci: 'pending', e2e: 'pending' } })),
+    [{ type: 'ensure-main-ci', sha: 'main-1', missing: ['ci', 'e2e'] }]);
+  assert.deepEqual(decide(state({ issues: ready, mainSha: 'main-1', missingMainChecks: ['ci', 'e2e'], mainCiWorkflowActive: true, mainChecks: { ci: 'pending', e2e: 'pending' } })), []);
+});
+
 test('pickReview takes the latest well-formed verdict', () => {
   const c = (body, t) => ({ body, created_at: new Date(NOW + t * 1000).toISOString() });
   const mark = (o) => `Findings.\n<!-- factory-review ${JSON.stringify(o)} -->`;
   assert.equal(pickReview([c('looks good', 0)]), null);
-  assert.equal(pickReview([c(mark({ sha: 'h1', verdict: 'maybe' }), 0)]), null);
-  assert.deepEqual(pickReview([c(mark({ sha: 'h1', verdict: 'reject' }), 0), c(mark({ sha: 'h1', verdict: 'approve' }), 5)]), { sha: 'h1', verdict: 'approve', at: NOW + 5000 });
+  assert.match(pickReview([c(mark({ sha: 'h1', verdict: 'maybe' }), 0)]).invalid, /invalid/);
+  assert.match(pickReview([c(mark({ sha: 'h1', verdict: 'reject', findings: [{ id: 'REV-1', severity: 'blocking', file: 'x', evidence: 'x:1 fails', affected_commit: 'h1', problem: 'bad', required_test: 'test it' }] }), 0), c(mark({ sha: 'h1', verdict: 'approve', findings: [] }), 5)]).invalid, /duplicate/);
+  const bound = c(mark({ sha: 'h1', goal_snapshot_sha: 'g1', verdict: 'approve', findings: [] }), 1);
+  assert.equal(pickReview([bound], { sha: 'h1', goalVersion: 'g1' }).verdict, 'approve');
+  assert.match(pickReview([bound], { sha: 'h2', goalVersion: 'g1' }).invalid, /stale/);
+  assert.match(pickReview([bound], { sha: 'h1', goalVersion: 'g2' }).invalid, /goal version/);
 });
 
 test('sensitive paths are never eligible for automatic merge', () => {
-  for (const f of ['.env', '.env.production', 'Dockerfile', 'docker-compose.yml', 'vercel.json', 'infra/main.tf', 'deploy/run.sh', 'fly.toml', '.npmrc', 'certs/server.pem', 'CODEOWNERS', '.claude/settings.json', 'app/wrangler.toml', 'db/migrations/001.sql']) {
+  for (const f of ['.env', '.env.production', 'Dockerfile', 'docker-compose.yml', 'vercel.json', 'infra/main.tf', 'deploy/run.sh', 'fly.toml', '.npmrc', 'certs/server.pem', 'CODEOWNERS', '.claude/settings.json', 'factory/plan.json', 'app/wrangler.toml', 'db/migrations/001.sql']) {
     assert.ok(touchesProtected([f]), f);
   }
   for (const f of ['.env.example', 'src/app/page.tsx', 'package.json', 'docs/decisions/1-x.md', 'src/deploy-banner.ts']) {
@@ -236,6 +261,11 @@ test('removing a CI script or deleting tests is flagged', () => {
 test('all tasks closed reports Complete', () => {
   const issues = [issue(T1, 2, 'in-review', { open: false }), issue(T2, 3, 'in-review', { open: false })];
   assert.deepEqual(decide(state({ issues })), [{ type: 'note', text: 'Complete' }]);
+});
+
+test('a manually closed task without a merged attempt is never completion evidence', () => {
+  const closed = issue(T1, 2, 'in-review', { open: false, mergedForAttempt: false });
+  assert.match(decide(state({ plan: { goals_sha: 'abc', tasks: [T1] }, issues: [closed] }))[0].text, /without a confirmed merged attempt/);
 });
 
 test('difficulty is optional but must be routine or hard', () => {
@@ -325,4 +355,76 @@ test('a superseded duplicate never closes the pull request of the live issue', (
   // a task dropped from the plan still has its pull request closed
   const T9 = { ...T1, id: 'G1-T9' };
   assert.deepEqual(decide(state({ plan: { goals_sha: 'abc', tasks: [T9] }, issues: [dup, issue(T9, 6, 'ready')] }))[0], { type: 'closePr', number: 5, issue: 3 });
+});
+
+test('Phase 2 plan requires durable architecture, invariants, mappings and a real smoke contract', async () => {
+  const { goalSnapshotHash, makeGoalSnapshot, goalIdsForSnapshot, completionGate, pickFinalReview, verifiedGoalSnapshot } = await import('./lib.mjs');
+  const snapshot = makeGoalSnapshot({ number: 44, title: 'Real product', body: '## G1: Product\nBuild the product.' });
+  const task = { ...T1 };
+  const good = {
+    goals_sha: snapshot.hash, goal_snapshot_sha: snapshot.hash,
+    architecture: { components: ['web'], data_model: [], security_boundaries: ['browser'] },
+    assumptions: ['The goal is a web product'], constraints: ['No deployment'],
+    decisions: [{ id: 'ADR-001', decision: 'Use a web UI', rationale: 'The goal needs browser interaction', alternatives: ['CLI'], requires_human_approval: false }],
+    invariants: ['Never fabricate output'],
+    requirements: [{ id: 'REQ-001', description: 'Product flow', acceptance_tests: ['A user sees a result'], tasks: ['G1-T1'] }],
+    completion: { required_checks: ['ci', 'e2e'], smoke_test: { name: 'real flow', command: 'npm run e2e', assertions: ['result is visible'] } },
+    tasks: [task],
+  };
+  assert.equal(goalSnapshotHash(snapshot.body, snapshot.title), snapshot.hash);
+  assert.equal(verifiedGoalSnapshot(null), null);
+  assert.equal(verifiedGoalSnapshot(snapshot), snapshot);
+  assert.equal(verifiedGoalSnapshot({ ...snapshot, body: 'tampered' }), null);
+  assert.deepEqual(validatePlan(good, goalIdsForSnapshot(snapshot.body), { goalSnapshot: snapshot }), []);
+  assert.ok(validatePlan({ ...good, completion: { required_checks: ['ci', 'e2e'], smoke_test: { name: 'placeholder', command: 'echo pass', assertions: ['true;'] } } }, ['G1'], { goalSnapshot: snapshot }).length);
+  assert.equal(completionGate({ goalSnapshot: snapshot, plan: good, mainChecks: { ci: 'green', e2e: 'green' }, mainSha: 'm1', finalReview: { sha: 'm1', goal_snapshot_sha: snapshot.hash, verdict: 'approve', findings: [], reconciliation: [{ id: 'G1', status: 'satisfied', evidence: 'e2e' }] } }).ok, true);
+  assert.equal(pickFinalReview([], { sha: 'm1' }), null);
+});
+
+test('final review rejects stale, unauthorized and duplicate results', async () => {
+  const { pickFinalReview, renderFinalReview } = await import('./lib.mjs');
+  const review = { sha: 'm1', goal_snapshot_sha: 'g1', verdict: 'approve', findings: [], reconciliation: [{ id: 'G1', status: 'satisfied', evidence: 'tested' }] };
+  const c = (body, at, user = 'reviewer') => ({ body, created_at: new Date(at).toISOString(), user: { login: user } });
+  assert.match(pickFinalReview([c(renderFinalReview(review), NOW + 1000, 'reviewer')], { sha: 'm2', expectedAuthor: 'reviewer', goalVersion: 'g1', after: NOW }).invalid, /stale/);
+  assert.match(pickFinalReview([c(renderFinalReview(review), NOW + 1000, 'worker')], { sha: 'm1', expectedAuthor: 'reviewer', goalVersion: 'g1', after: NOW }).invalid, /unauthorized/);
+  assert.match(pickFinalReview([c(renderFinalReview(review), NOW + 1000), c(renderFinalReview(review), NOW + 2000)], { sha: 'm1', expectedAuthor: 'reviewer', goalVersion: 'g1', after: NOW }).invalid, /duplicate/);
+  const malformed = { ...review, verdict: 'reject', reconciliation: [{ id: 'G1', status: 'not_satisfied', evidence: 'missing' }], findings: [{ id: 'FINAL-1', severity: 'blocking', file: 'src/a.js', problem: 'missing behavior', required_test: 'test behavior', autonomous_fix: true, acceptance_tests: ['behavior is visible'] }] };
+  assert.match(pickFinalReview([c(renderFinalReview(malformed), NOW + 1000)], { sha: 'm1', expectedAuthor: 'reviewer', goalVersion: 'g1', after: NOW }).invalid, /malformed/);
+});
+
+test('completion remains blocked by unresolved canonical audit history', async () => {
+  const { completionGate, makeGoalSnapshot } = await import('./lib.mjs');
+  const snapshot = makeGoalSnapshot({ number: 1, title: 'Goal', body: '## G1: App' });
+  const finalReview = { sha: 'm1', goal_snapshot_sha: snapshot.hash, verdict: 'approve', findings: [], reconciliation: [{ id: 'G1', status: 'satisfied', evidence: 'e2e' }] };
+  const gate = completionGate({ goalSnapshot: snapshot, mainSha: 'm1', mainChecks: { ci: 'green', e2e: 'green' }, finalReview,
+    status: { canonical: { findings: { 'OLD-1': { id: 'OLD-1', severity: 'blocking', status: 'corrected-pending-final-review' } } } } });
+  assert.equal(gate.ok, false);
+  assert.match(gate.missing.join(' '), /remain unresolved/);
+});
+
+test('shared worker and reviewer identity fails closed instead of trusting a replayable comment secret', () => {
+  const base = { credentialIsolated: false, dispatcher: 'github-actions[bot]', worker: 'owner', reviewer: 'owner' };
+  assert.match(identityBoundaryError(base), /must be distinct.*not secure/);
+  assert.equal(identityBoundaryError({ ...base, reviewer: 'reviewer' }), null);
+  assert.match(identityBoundaryError({ ...base, reviewer: 'github-actions[bot]' }), /must be distinct/);
+  assert.equal(identityBoundaryError({ credentialIsolated: true, dispatcher: 'github-actions[bot]' }), null);
+  assert.match(identityBoundaryError({ credentialIsolated: true, dispatcher: '' }), /dispatcher identity/);
+});
+
+test('final product review is routed separately from task review', () => {
+  const routes = [];
+  for (const action of decide(state({ plan: null }))) routes.push(action.route);
+  assert.deepEqual(routes, ['planner']);
+});
+
+test('on a public repository only the configured owner can submit a goal', () => {
+  const goal = (number, login, extra = {}) => ({ number, title: '/goal claude build it', body: '## G1: App', labels: [], user: { login }, ...extra });
+  const issues = [goal(5, 'stranger'), goal(7, 'owner'), goal(9, 'another-stranger'), goal(11, 'stranger', { labels: [{ name: 'factory-goal' }] })];
+  assert.deepEqual(goalCandidates(issues, 'owner').map((issue) => issue.number), [7]);
+  // Strangers' goals neither fire anything nor make the owner's goal ambiguous.
+  assert.deepEqual(goalCandidates([goal(5, 'stranger')], 'owner'), []);
+  // No configured owner accepts no goals at all.
+  assert.deepEqual(goalCandidates(issues, ''), []);
+  assert.deepEqual(goalCandidates(issues, undefined), []);
+  assert.deepEqual(goalCandidates([goal(3, 'owner', { body: 'no command', title: 'unrelated' })], 'owner'), []);
 });
