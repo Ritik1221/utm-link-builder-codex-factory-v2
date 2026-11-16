@@ -7,14 +7,18 @@ import { applyChangeSet, parseAgentResultReceipts, renderAgentResultReceipt, sou
 import { branchOf, goalIdsForSnapshot, renderFinalReview, validatePlan, validateReview } from '../lib.mjs';
 import { fetchInvocation } from './prepare-codex-job.mjs';
 
-async function api(token, repository, method, route, body) {
-  const response = await fetch(`https://api.github.com/repos/${repository}${route}`, {
+async function githubApi(token, method, route, body) {
+  const response = await fetch(`https://api.github.com${route}`, {
     method,
     headers: { authorization: `Bearer ${token}`, accept: 'application/vnd.github+json', 'content-type': 'application/json', 'x-github-api-version': '2022-11-28' },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   if (!response.ok) throw new Error(`GitHub ${method} ${route}: ${response.status} ${(await response.text()).slice(0, 500)}`);
   return response.status === 204 ? null : response.json();
+}
+
+async function api(token, repository, method, route, body) {
+  return githubApi(token, method, `/repos/${repository}${route}`, body);
 }
 
 async function all(token, repository, route) {
@@ -26,9 +30,23 @@ async function all(token, repository, route) {
   }
 }
 
-function command(name, args, cwd) {
+function commandEnvironment(extra = {}) {
+  const allowed = Object.fromEntries(['PATH', 'HOME', 'TMPDIR', 'LANG', 'LC_ALL'].filter((key) => process.env[key]).map((key) => [key, process.env[key]]));
+  return { ...allowed, GIT_TERMINAL_PROMPT: '0', ...extra };
+}
+
+export function publisherGitEnvironment(token) {
+  if (!token) throw new Error('trusted publisher token is required for a repository write');
+  return commandEnvironment({
+    GIT_CONFIG_COUNT: '1',
+    GIT_CONFIG_KEY_0: 'http.https://github.com/.extraheader',
+    GIT_CONFIG_VALUE_0: `AUTHORIZATION: basic ${Buffer.from(`x-access-token:${token}`).toString('base64')}`,
+  });
+}
+
+function command(name, args, cwd, env = commandEnvironment()) {
   return new Promise((resolve, reject) => {
-    const child = spawn(name, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], shell: false });
+    const child = spawn(name, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], shell: false });
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (chunk) => { stdout += chunk; });
@@ -72,14 +90,22 @@ export function reconcileReceipt(receipts, result) {
   return { action: 'needs-human', reason: 'conflicting or duplicate result receipts exist for the invocation' };
 }
 
-async function publishCode({ invocation, result, repository, token, checkoutRoot }) {
+export async function verifyPublisherIdentity(token, expectedLogin) {
+  if (!token || !expectedLogin) throw new Error('trusted publisher token and login are required');
+  const user = await githubApi(token, 'GET', '/user');
+  if (user?.login !== expectedLogin) throw new Error(`trusted publisher identity mismatch: expected ${expectedLogin}, received ${user?.login ?? 'unknown'}`);
+  return user.login;
+}
+
+async function publishCode({ invocation, result, publisherToken, publisherLogin, checkoutRoot }) {
+  const gitEnv = publisherGitEnvironment(publisherToken);
   const branch = invocation.role === 'planner' ? 'factory/plan' : branchOf(invocation.task_id, invocation.attempt);
-  const remote = await command('git', ['ls-remote', '--heads', 'origin', `refs/heads/${branch}`], checkoutRoot);
+  const remote = await command('git', ['ls-remote', '--heads', 'origin', `refs/heads/${branch}`], checkoutRoot, gitEnv);
   const remoteSha = remote.split(/\s/)[0] || null;
   await applyChangeSet(checkoutRoot, result, invocation);
   await command('git', ['add', '--all'], checkoutRoot);
   if (remoteSha) {
-    await command('git', ['fetch', '--no-tags', 'origin', `refs/heads/${branch}:refs/remotes/origin/${branch}`], checkoutRoot);
+    await command('git', ['fetch', '--no-tags', 'origin', `refs/heads/${branch}:refs/remotes/origin/${branch}`], checkoutRoot, gitEnv);
     try {
       await command('git', ['diff', '--quiet', `refs/remotes/origin/${branch}`, '--'], checkoutRoot);
       return { branch, sha: remoteSha, adopted: true };
@@ -88,24 +114,26 @@ async function publishCode({ invocation, result, repository, token, checkoutRoot
     }
   }
   await command('git', ['checkout', '-B', branch], checkoutRoot);
-  await command('git', ['config', 'user.name', 'factory-dispatcher'], checkoutRoot);
-  await command('git', ['config', 'user.email', 'factory-dispatcher@users.noreply.github.com'], checkoutRoot);
+  await command('git', ['config', 'user.name', publisherLogin], checkoutRoot);
+  await command('git', ['config', 'user.email', `${publisherLogin}@users.noreply.github.com`], checkoutRoot);
   await command('git', ['commit', '-m', invocation.role === 'planner' ? `factory: plan ${invocation.goal_id}` : `factory: ${invocation.task_id} attempt ${invocation.attempt}`], checkoutRoot);
   const push = ['push', 'origin', `HEAD:refs/heads/${branch}`];
   if (remoteSha && invocation.role === 'planner') push.splice(1, 0, `--force-with-lease=refs/heads/${branch}:${remoteSha}`);
-  await command('git', push, checkoutRoot);
+  await command('git', push, checkoutRoot, gitEnv);
   return { branch, sha: await command('git', ['rev-parse', 'HEAD'], checkoutRoot), adopted: false };
 }
 
-async function ensurePullRequest({ invocation, branch, repository, token }) {
+export async function ensurePullRequest({ invocation, branch, repository, token, publisherLogin }) {
   const pulls = await all(token, repository, `/pulls?state=all&head=${encodeURIComponent(`${repository.split('/')[0]}:${branch}`)}&base=main`);
   if (pulls.length > 1) throw new Error(`multiple pull requests exist for ${branch}`);
-  if (pulls[0]) return pulls[0];
-  return api(token, repository, 'POST', '/pulls', {
+  const pull = pulls[0] ?? await api(token, repository, 'POST', '/pulls', {
     title: `[${invocation.task_id}] autonomous attempt ${invocation.attempt}`,
     head: branch, base: 'main',
     body: `Trusted dispatcher publication for ${invocation.id}. Agent execution had no GitHub credentials.`,
   });
+  if (pull.user?.login !== publisherLogin) throw new Error(`pull request author is ${pull.user?.login ?? 'unknown'}, expected trusted publisher ${publisherLogin}`);
+  if (pull.head?.ref !== branch || pull.base?.ref !== 'main') throw new Error('pull request branch or base does not match the invocation');
+  return pull;
 }
 
 async function ensureCi({ repository, token, ref, sha }) {
@@ -120,7 +148,7 @@ async function ensureCi({ repository, token, ref, sha }) {
 // completed invocation, so a failed agent is visible in GitHub Actions.
 export const publicationExitCode = (outcome) => (outcome?.receipt?.status === 'completed' ? 0 : 1);
 
-export async function publishCodexResult({ token, repository, dispatcherLogin, invocationId, inputRoot, resultRoot, checkoutRoot, workflowRunId = null }) {
+export async function publishCodexResult({ token, publisherToken, publisherLogin, repository, dispatcherLogin, invocationId, inputRoot, resultRoot, checkoutRoot, workflowRunId = null }) {
   const recovered = await fetchInvocation({ token, repository, invocationId, dispatcherLogin });
   const invocation = recovered.invocation;
   const input = JSON.parse(await readFile(path.join(inputRoot, 'input.json'), 'utf8'));
@@ -137,11 +165,12 @@ export async function publishCodexResult({ token, repository, dispatcherLogin, i
 
   let evidence = null;
   if (result.status === 'completed' && ['planner', 'worker', 'corrective-worker'].includes(invocation.role)) {
+    await verifyPublisherIdentity(publisherToken, publisherLogin);
     const current = await sourceManifest(checkoutRoot);
     if (current.sha256 !== input.source_manifest.sha256) throw new Error('publisher checkout is not the exact source snapshot');
-    evidence = await publishCode({ invocation, result, repository, token, checkoutRoot });
+    evidence = await publishCode({ invocation, result, publisherToken, publisherLogin, checkoutRoot });
     if (invocation.role !== 'planner') {
-      const pullRequest = await ensurePullRequest({ invocation, branch: evidence.branch, repository, token });
+      const pullRequest = await ensurePullRequest({ invocation, branch: evidence.branch, repository, token: publisherToken, publisherLogin });
       evidence.pull_request = pullRequest.number;
       evidence.sha = pullRequest.head.sha;
       evidence.ci_dispatched = await ensureCi({ repository, token, ref: evidence.branch, sha: pullRequest.head.sha });
@@ -176,6 +205,7 @@ export async function publishCodexResult({ token, repository, dispatcherLogin, i
 async function main() {
   const outcome = await publishCodexResult({
     token: process.env.GITHUB_TOKEN, repository: process.env.GITHUB_REPOSITORY,
+    publisherToken: process.env.FACTORY_PUBLISH_TOKEN, publisherLogin: process.env.FACTORY_PUBLISHER_LOGIN,
     dispatcherLogin: process.env.FACTORY_DISPATCHER_LOGIN,
     invocationId: process.env.FACTORY_INVOCATION_ID,
     inputRoot: process.env.FACTORY_INPUT_ROOT, resultRoot: process.env.FACTORY_RESULT_ROOT,

@@ -60,7 +60,8 @@ failed closed.
 ## Stage B — one bounded real provider
 
 Run only after Stage A passes and the owner explicitly names `claude` or `codex`.
-Use a fresh disposable private repository and one goal with two or three tasks.
+For the zero-cost protected-branch validation, use a fresh disposable **public**
+repository containing only synthetic code and one goal with two or three tasks.
 The scenario must include one deliberately review-rejected defect and a final
 review omission that is safe to correct automatically.
 
@@ -73,10 +74,11 @@ review omission that is safe to correct automatically.
    `FACTORY_OWNER_LOGIN`; decisions marked as requiring human approval proceed
    only after that account comments exactly
    `/approve ADR-NNN <plan-hash-shown-by-the-dispatcher>` on the goal.
-4. On a GitHub Free personal private repository, treat branch protection as
-   unavailable unless the repository API proves otherwise. Preserve exact-SHA,
-   protected-path and reviewer checks in the dispatcher, but report them as
-   application controls—not equivalent GitHub enforcement.
+4. GitHub Free does not enforce protected branches or rulesets for private
+   repositories. Use a public synthetic repository when required reviews and
+   checks must be platform-enforced. In a private Free repository, preserve the
+   dispatcher checks but report them as application controls—not equivalent
+   GitHub enforcement.
 5. Set a hard experiment budget: maximum 3 task attempts, 2 task reviews, 2 final
    reviews, 2 correction rounds, 6 correction tasks and the existing workflow
    timeout. Pause immediately on unexpected billing, credential prompts or
@@ -122,7 +124,7 @@ review omission that is safe to correct automatically.
    revalidates hashes, exact base content, role-specific paths and structured
    output before creating branches, PRs or review comments. Codex never receives
    a repository credential.
-6. Configure the private disposable repository variables:
+6. Configure the public disposable repository variables:
    - `FACTORY_ACTIVE_PROVIDER=codex`
    - `FACTORY_AGENT_EXECUTION=enabled`
    - `FACTORY_CODEX_EXECUTION_MODE=github-actions`
@@ -132,15 +134,23 @@ review omission that is safe to correct automatically.
    - `FACTORY_MAX_INVOCATIONS=12`
    - `FACTORY_MAX_TASKS=2`
 
-   Leave every Claude routine/token, OpenAI API key, runner token and personal
-   access token absent from repository secrets. The temporary GitHub runner
-   registration token is used only during runner setup and is not exposed to the
-   Codex child.
-7. In GitHub billing, verify included Actions compute/storage remains and create
-   a zero-dollar Actions budget with **Stop usage when budget limit is reached**.
-   Private-repository prepare, publish and CI jobs consume the included
-   GitHub-hosted allowance; self-hosted execution itself is free. Do not start if
-   GitHub would permit overage billing.
+   The default immutable Codex routes are `gpt-5.6-sol/high` for planner,
+   corrective worker, reviewer and final reviewer, and
+   `gpt-5.6-luna/medium` for the ordinary worker. A role override requires both
+   `FACTORY_CODEX_MODEL_<ROLE>` and `FACTORY_CODEX_REASONING_<ROLE>` and must use
+   an allowlisted model from the verified CLI catalog. Partial or unknown values
+   fail closed.
+
+   Leave every Claude routine/token, OpenAI API key and runner token absent from
+   repository secrets. After separate owner approval, store only the existing
+   repository-scoped fine-grained publisher PAT as `FACTORY_PUBLISH_TOKEN` and
+   set `FACTORY_PUBLISHER_LOGIN=Ritik1221`. Its only repository permissions are
+   Contents read/write and Pull requests read/write (plus mandatory Metadata
+   read). The temporary GitHub runner registration token is used only during
+   runner setup. Neither token is exposed to the Codex child.
+7. Verify included Actions compute/storage remains. Do not add a payment method,
+   paid plan, API key or credit balance. Public-repository GitHub-hosted jobs and
+   self-hosted execution are free, subject to GitHub's usage and abuse limits.
 8. Keep the host awake and online for the bounded experiment. Each dispatch
    carries a `not_after` deadline 20 minutes ahead. The root-owned wrapper
    refuses to start Codex after it (no result, no receipt, no ledger attempt).
@@ -179,9 +189,11 @@ review omission that is safe to correct automatically.
 The broker, idempotency and adversarial behavior are tested locally. The Linux
 account, mode and launcher boundary is tested in Docker with a probe in place of
 Codex: `sh .github/factory-runner-test/run.sh`. Actions artifact provenance,
-private-repository token permissions, real `codex exec` inside the bubblewrap
+live GitHub token permissions, real `codex exec` inside the bubblewrap
 sandbox and real ChatGPT subscription behavior remain unverified until the
-owner-approved live run.
+owner-approved live run. The `github-actions[bot]` approval counting toward the
+required review and the subsequent exact-SHA merge must be proven in the public
+disposable repository; local tests cannot establish GitHub's enforcement behavior.
 
 ### First Codex-only goal: UTM Link Builder
 
@@ -217,7 +229,7 @@ credential-boundary failure stops the experiment.
 
 ### Launch checklist
 
-- [ ] New disposable private repository contains only the approved factory
+- [ ] New disposable public repository contains only the approved factory
       template and synthetic UTM goal; FreightLens and existing repositories are untouched.
 - [ ] Local regression suite, guard test, secret scan and YAML parse pass at the
       exact factory commit copied to the repository.
@@ -225,8 +237,15 @@ credential-boundary failure stops the experiment.
 - [ ] Dedicated runner and Codex identities/VM contain no unrelated files or credentials.
 - [ ] `codex login status` says ChatGPT login; no OpenAI/Anthropic API key exists.
 - [ ] GitHub runner is online with only `self-hosted,factory-codex-isolated` labels.
-- [ ] Repository variables above are exact; no provider or PAT secrets exist.
-- [ ] GitHub Actions overage spending is blocked and included usage is available.
+- [ ] Fine-grained publisher PAT is scoped only to this repository with Contents
+      and Pull requests read/write; it is stored only as `FACTORY_PUBLISH_TOKEN`.
+- [ ] `FACTORY_PUBLISHER_LOGIN=Ritik1221`; the PAT `/user` preflight returns that
+      exact login; no provider API key or Claude secret exists.
+- [ ] `main` requires one approval, stale approvals are dismissed, `ci` and `e2e`
+      are required, direct/force pushes and deletion are blocked, and Actions is
+      explicitly allowed to approve PRs.
+- [ ] The account still has no payment method or paid Actions billing enabled;
+      the experiment uses only public-repository and self-hosted Actions.
 - [ ] Owner records the starting main SHA, Actions run ids and ChatGPT usage view.
 - [ ] Owner opens the single `/goal codex` issue and performs no task management.
 - [ ] Stop immediately on a security-boundary violation, unexpected billing or

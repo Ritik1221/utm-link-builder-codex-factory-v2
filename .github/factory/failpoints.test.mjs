@@ -58,7 +58,9 @@ test('Codex workflow keeps model execution credential-free and publication GitHu
   assert.match(execute, /\/usr\/local\/libexec\/factory-codex\/execute/);
   assert.match(publish, /runs-on: ubuntu-latest/);
   assert.match(publish, /actions: write/);
-  assert.match(publish, /contents: write/);
+  assert.match(publish, /contents: read/);
+  assert.doesNotMatch(publish, /contents: write|pull-requests: write/);
+  assert.match(publish, /secrets\.FACTORY_PUBLISH_TOKEN/);
   assert.match(publish, /publish-codex-result\.mjs/);
   assert.doesNotMatch(workflow, /actions\/(checkout|upload-artifact|download-artifact)@v\d/);
   const publisher = readFileSync(new URL('runner/publish-codex-result.mjs', import.meta.url), 'utf8');

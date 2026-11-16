@@ -22,6 +22,7 @@ const AGENT_UID = 10002;
 const invocation = (attempt) => makeInvocation({
   goal_id: 'G1', goal_version: 'goal-version', role: 'worker', provider: 'codex', repository: 'owner/repo',
   base_sha: 'a'.repeat(40), task_id: 'G1-T1', issue: 3, attempt, timeout_ms: 60_000, retry_budget: 2,
+  execution_config: { model: 'gpt-5.6-luna', reasoning_effort: 'medium' },
   immutable_context: {}, output_schema: outputSchemaForRole('worker'),
 });
 

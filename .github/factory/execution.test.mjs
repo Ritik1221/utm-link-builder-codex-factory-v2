@@ -10,7 +10,7 @@ import {
 } from './execution.mjs';
 import { makeInvocation } from './providers/contract.mjs';
 import { recoverInvocation } from './runner/prepare-codex-job.mjs';
-import { publicationExitCode, publishCodexResult, reconcileReceipt, validatePublishableResult } from './runner/publish-codex-result.mjs';
+import { ensurePullRequest, publicationExitCode, publishCodexResult, publisherGitEnvironment, reconcileReceipt, validatePublishableResult, verifyPublisherIdentity } from './runner/publish-codex-result.mjs';
 import { emptyFactoryState, prepareEvent, renderEvent, withFactoryState } from './state.mjs';
 import { restrictedEnvironment, runCodexCli } from './runner/codex-cli.mjs';
 import { packageCodexInput, validateDispatchDeadline } from './runner/prepare-codex-job.mjs';
@@ -20,6 +20,7 @@ const invocation = (role = 'worker', extra = {}) => makeInvocation({
   goal_id: 'G1', goal_version: 'goal-version', role, provider: 'codex', repository: 'owner/repo',
   base_sha: 'a'.repeat(40), task_id: ['worker', 'corrective-worker', 'reviewer'].includes(role) ? 'G1-T1' : null,
   issue: 3, pull_request: role === 'reviewer' ? 9 : null, attempt: 1, timeout_ms: 60_000, retry_budget: 2,
+  execution_config: { model: role === 'worker' ? 'gpt-5.6-luna' : 'gpt-5.6-sol', reasoning_effort: role === 'worker' ? 'medium' : 'high' },
   immutable_context: {}, output_schema: { type: 'object' }, ...extra,
 });
 
@@ -316,7 +317,7 @@ async function publicationFixture(inv, details) {
   await mkdir(path.join(root, 'result'));
   await writeFile(path.join(root, 'input/input.json'), JSON.stringify(input));
   await writeFile(path.join(root, 'result/result.json'), JSON.stringify(result));
-  const options = { token: 't', repository: 'owner/repo', dispatcherLogin: 'github-actions[bot]', invocationId: inv.id,
+  const options = { token: 't', publisherToken: 'publisher-token', publisherLogin: 'Ritik1221', repository: 'owner/repo', dispatcherLogin: 'github-actions[bot]', invocationId: inv.id,
     inputRoot: path.join(root, 'input'), resultRoot: path.join(root, 'result'), checkoutRoot: root, workflowRunId: '77' };
   return { root, result, options };
 }
@@ -325,6 +326,7 @@ test('a failed agent result is published as a receipt and turns the workflow red
   const inv = invocation('worker');
   const { root, options } = await publicationFixture(inv, { status: 'failed', error: { code: 'codex-exec', message: 'Permission denied (os error 13)' } });
   try {
+    options.publisherToken = undefined;
     const { outcome, calls } = await withGitHub(inv, [], () => publishCodexResult(options));
     const posted = calls.filter((call) => call.method === 'POST');
     assert.deepEqual(posted.map((call) => call.route), ['/issues/5/comments']);
@@ -365,6 +367,40 @@ test('a completed review (even a rejection) publishes green without recursively 
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+test('trusted publisher identity is exact and fails closed before publication', async () => {
+  const original = globalThis.fetch;
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({ login: 'Ritik1221' }), text: async () => '' });
+  try {
+    assert.equal(await verifyPublisherIdentity('token', 'Ritik1221'), 'Ritik1221');
+    await assert.rejects(() => verifyPublisherIdentity('token', 'someone-else'), /identity mismatch/);
+    await assert.rejects(() => verifyPublisherIdentity('', 'Ritik1221'), /required/);
+  } finally { globalThis.fetch = original; }
+});
+
+test('publisher git authentication is process-local and does not forward repository secrets by name', () => {
+  const env = publisherGitEnvironment('publisher-secret');
+  assert.equal(env.FACTORY_PUBLISH_TOKEN, undefined);
+  assert.equal(env.GITHUB_TOKEN, undefined);
+  assert.equal(env.OPENAI_API_KEY, undefined);
+  assert.equal(env.GIT_TERMINAL_PROMPT, '0');
+  assert.equal(env.GIT_CONFIG_KEY_0, 'http.https://github.com/.extraheader');
+  assert.equal(Buffer.from(env.GIT_CONFIG_VALUE_0.replace('AUTHORIZATION: basic ', ''), 'base64').toString(), 'x-access-token:publisher-secret');
+  assert.doesNotMatch(JSON.stringify(env), /publisher-secret/);
+});
+
+test('only a pull request authored by the configured trusted publisher is adopted', async () => {
+  const inv = invocation('worker');
+  const original = globalThis.fetch;
+  const response = (value) => ({ ok: true, status: 200, json: async () => value, text: async () => JSON.stringify(value) });
+  try {
+    globalThis.fetch = async () => response([{ user: { login: 'Ritik1221' }, head: { ref: 'factory/G1-T1-a1' }, base: { ref: 'main' } }]);
+    const pull = await ensurePullRequest({ invocation: inv, branch: 'factory/G1-T1-a1', repository: 'owner/repo', token: 'publisher', publisherLogin: 'Ritik1221' });
+    assert.equal(pull.user.login, 'Ritik1221');
+    globalThis.fetch = async () => response([{ user: { login: 'github-actions[bot]' }, head: { ref: 'factory/G1-T1-a1' }, base: { ref: 'main' } }]);
+    await assert.rejects(() => ensurePullRequest({ invocation: inv, branch: 'factory/G1-T1-a1', repository: 'owner/repo', token: 'publisher', publisherLogin: 'Ritik1221' }), /author is github-actions/);
+  } finally { globalThis.fetch = original; }
+});
+
 test('codex-agent workflow passes the deadline, keeps execute credential-free and has one bounded dispatcher wake-up', async () => {
   const workflow = await readFile(new URL('../workflows/codex-agent.yml', import.meta.url), 'utf8');
   const job = (name) => workflow.split(/\n  (?=[a-z]+:\n)/).find((block) => block.startsWith(`${name}:`)) ?? '';
@@ -372,7 +408,13 @@ test('codex-agent workflow passes the deadline, keeps execute credential-free an
   assert.match(job('prepare'), /FACTORY_NOT_AFTER: \$\{\{ inputs\.not_after \}\}/);
   assert.match(job('execute'), /permissions: \{\}/);
   assert.doesNotMatch(job('execute'), /GITHUB_TOKEN|secrets\./);
-  assert.doesNotMatch(job('publish'), /actions: write|reconciliation_requested/);
+  assert.match(job('publish'), /actions: write/);
+  assert.match(job('publish'), /FACTORY_PUBLISH_TOKEN: \$\{\{ secrets\.FACTORY_PUBLISH_TOKEN \}\}/);
+  assert.match(job('publish'), /FACTORY_PUBLISHER_LOGIN: \$\{\{ vars\.FACTORY_PUBLISHER_LOGIN \}\}/);
+  assert.doesNotMatch(job('execute'), /FACTORY_PUBLISH_TOKEN|FACTORY_PUBLISHER_LOGIN/);
+  assert.doesNotMatch(job('prepare'), /FACTORY_PUBLISH_TOKEN/);
+  assert.doesNotMatch(job('reconcile'), /FACTORY_PUBLISH_TOKEN/);
+  assert.doesNotMatch(job('publish'), /pull-requests: write|contents: write/);
   assert.match(job('reconcile'), /if: always\(\)/);
   assert.match(job('reconcile'), /gh workflow run factory\.yml --repo "\$GITHUB_REPOSITORY" --ref main/);
   assert.match(job('reconcile'), /permissions:\n\s+actions: write\n\s+steps:/);

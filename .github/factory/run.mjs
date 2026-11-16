@@ -12,6 +12,7 @@ import {
   updateInvocation, recordFinding, recordOperation, recordDecision,
 } from './state.mjs';
 import { makeInvocation } from './providers/contract.mjs';
+import { resolveCodexRoute } from './providers/codex-routing.mjs';
 import { createProviderRegistry } from './providers/index.mjs';
 import { approveExactCommit, reconcileAgentExecution, reconcileAttempt, reconcileMerge, reconcileTaskCreation } from './recovery.mjs';
 import { renderProjectReport } from './report.mjs';
@@ -416,6 +417,7 @@ function invocationFor(action, state) {
     task_id: task?.id ?? null, issue: action.number ?? action.goalIssue ?? null,
     pull_request: action.pr ?? null, attempt: action.attempt ?? action.reviews ?? action.fires ?? 1,
     timeout_ms: 20 * 60_000, retry_budget: Math.max(0, 3 - (action.attempt ?? action.reviews ?? action.fires ?? 1)),
+    ...(provider === 'codex' ? { execution_config: resolveCodexRoute(role) } : {}),
     immutable_context: context,
     output_schema: outputSchemaForRole(role),
   });

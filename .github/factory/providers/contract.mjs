@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { validateCodexExecutionConfig } from './codex-routing.mjs';
 
 export const CONTRACT_VERSION = 1;
 export const PROVIDERS = ['claude', 'codex'];
@@ -22,6 +23,7 @@ export function makeInvocation(input) {
     attempt: input.attempt ?? 1,
     timeout_ms: input.timeout_ms,
     retry_budget: input.retry_budget,
+    ...(input.execution_config === undefined ? {} : { execution_config: input.execution_config }),
     immutable_context: input.immutable_context ?? {},
     output_schema: input.output_schema,
   };
@@ -39,6 +41,9 @@ export function validateInvocation(invocation) {
   if (!Number.isInteger(invocation?.attempt) || invocation.attempt < 1) errors.push('attempt must be positive');
   if (!Number.isInteger(invocation?.timeout_ms) || invocation.timeout_ms < 1000) errors.push('timeout_ms is invalid');
   if (!Number.isInteger(invocation?.retry_budget) || invocation.retry_budget < 0) errors.push('retry_budget is invalid');
+  if (invocation?.provider === 'codex') {
+    errors.push(...validateCodexExecutionConfig(invocation.execution_config));
+  }
   if (!invocation?.output_schema || typeof invocation.output_schema !== 'object') errors.push('output_schema is required');
   if (invocation?.id !== `inv_${digest(Object.fromEntries(Object.entries(invocation).filter(([key]) => key !== 'id'))).slice(0, 24)}`) errors.push('invocation id does not match its content');
   return errors;

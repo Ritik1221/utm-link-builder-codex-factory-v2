@@ -20,7 +20,13 @@ export function codexCommand(invocation, { workspace, schemaPath, outputPath }) 
   const readOnly = ['reviewer', 'final-reviewer'].includes(invocation.role);
   return {
     command: 'codex',
-    args: ['--ask-for-approval', 'never', 'exec', '--ephemeral', '--ignore-user-config', '--skip-git-repo-check', '--json', '--sandbox', readOnly ? 'read-only' : 'workspace-write', '--output-schema', schemaPath, '--output-last-message', outputPath, '--cd', workspace, '-'],
+    args: [
+      '--model', invocation.execution_config.model,
+      '--config', `model_reasoning_effort=${JSON.stringify(invocation.execution_config.reasoning_effort)}`,
+      '--strict-config', '--ask-for-approval', 'never', 'exec', '--ephemeral', '--ignore-user-config',
+      '--skip-git-repo-check', '--json', '--sandbox', readOnly ? 'read-only' : 'workspace-write',
+      '--output-schema', schemaPath, '--output-last-message', outputPath, '--cd', workspace, '-',
+    ],
     prompt: [
       `Execute factory invocation ${invocation.id}.`,
       `Role: ${invocation.role}. Goal version: ${invocation.goal_version}.`,

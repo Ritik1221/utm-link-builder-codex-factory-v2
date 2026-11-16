@@ -90,9 +90,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      contents: write
+      actions: write
+      contents: read
       issues: write
-      pull-requests: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -103,6 +103,7 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.base_sha }}
           path: publish
+          persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: codex-input-${{ inputs.invocation_id }}
@@ -112,9 +113,13 @@ jobs:
           name: codex-result-${{ inputs.invocation_id }}
           path: ${{ runner.temp }}/factory-result
       # Exits non-zero after publishing any result other than completed.
+      # The publisher PAT is exposed only to this trusted script. It is used for
+      # branch push and PR creation, never passed to checkout or the agent job.
       - run: node control/.github/factory/runner/publish-codex-result.mjs
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          FACTORY_PUBLISH_TOKEN: ${{ secrets.FACTORY_PUBLISH_TOKEN }}
+          FACTORY_PUBLISHER_LOGIN: ${{ vars.FACTORY_PUBLISHER_LOGIN }}
           FACTORY_INVOCATION_ID: ${{ inputs.invocation_id }}
           FACTORY_DISPATCHER_LOGIN: ${{ vars.FACTORY_DISPATCHER_LOGIN || 'github-actions[bot]' }}
           FACTORY_INPUT_ROOT: ${{ runner.temp }}/factory-input

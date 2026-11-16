@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { makeInvocation, validateInvocation } from './contract.mjs';
 import { createClaudeAdapter } from './claude.mjs';
 import { createCodexAdapter } from './codex.mjs';
+import { CODEX_ROLE_ROUTES, resolveCodexRoute } from './codex-routing.mjs';
 import { createProviderRegistry } from './index.mjs';
 import { codexCommand, restrictedEnvironment } from '../runner/codex-cli.mjs';
 
@@ -12,6 +13,7 @@ const invocation = (provider = 'claude', role = 'worker') => makeInvocation({
   repository: 'owner/repo', base_sha: 'commit-sha', task_id: role === 'worker' ? 'G1-T1' : null,
   issue: 3, pull_request: role === 'reviewer' ? 7 : null, attempt: 1,
   timeout_ms: 5000, retry_budget: 2, immutable_context: { requirement: 'build it' },
+  ...(provider === 'codex' ? { execution_config: resolveCodexRoute(role, {}) } : {}),
   output_schema: { type: 'object' },
 });
 
@@ -68,6 +70,11 @@ test('Codex runner gives reviewers a read-only sandbox and workers workspace-wri
   assert.ok(review.args.includes('--ignore-user-config'));
   assert.ok(review.args.includes('--skip-git-repo-check'));
   assert.equal(review.args[review.args.indexOf('--ask-for-approval') + 1], 'never');
+  assert.equal(review.args[review.args.indexOf('--model') + 1], 'gpt-5.6-sol');
+  assert.equal(worker.args[worker.args.indexOf('--model') + 1], 'gpt-5.6-luna');
+  assert.ok(review.args.includes('model_reasoning_effort="high"'));
+  assert.ok(worker.args.includes('model_reasoning_effort="medium"'));
+  assert.ok(review.args.includes('--strict-config'));
   assert.equal(review.args[review.args.indexOf('--output-last-message') + 1], '/tmp/output.json');
   const env = restrictedEnvironment({ PATH: '/bin', OPENAI_API_KEY: 'paid-key', CODEX_API_KEY: 'paid-key', GITHUB_TOKEN: 'shared', FACTORY_REVIEWER_GITHUB_TOKEN: 'review-only', FACTORY_WORKER_GITHUB_TOKEN: 'worker-only', GIT_CONFIG_GLOBAL: '/home/user/.gitconfig' });
   assert.deepEqual(env, {
@@ -76,6 +83,24 @@ test('Codex runner gives reviewers a read-only sandbox and workers workspace-wri
     GIT_CONFIG_NOSYSTEM: '1',
     GIT_TERMINAL_PROMPT: '0',
   });
+});
+
+test('Codex model routing is role-specific, configurable only as validated pairs, and never falls back', () => {
+  assert.deepEqual(resolveCodexRoute('planner', {}), CODEX_ROLE_ROUTES.planner);
+  assert.deepEqual(resolveCodexRoute('worker', {}), CODEX_ROLE_ROUTES.worker);
+  assert.deepEqual(resolveCodexRoute('corrective-worker', {}), CODEX_ROLE_ROUTES['corrective-worker']);
+  assert.deepEqual(resolveCodexRoute('reviewer', {}), CODEX_ROLE_ROUTES.reviewer);
+  assert.deepEqual(resolveCodexRoute('final-reviewer', {}), CODEX_ROLE_ROUTES['final-reviewer']);
+  assert.deepEqual(resolveCodexRoute('worker', {
+    FACTORY_CODEX_MODEL_WORKER: 'gpt-5.6-terra', FACTORY_CODEX_REASONING_WORKER: 'high',
+  }), { model: 'gpt-5.6-terra', reasoning_effort: 'high' });
+  assert.throws(() => resolveCodexRoute('worker', { FACTORY_CODEX_MODEL_WORKER: 'gpt-5.6-sol' }), /must be configured together/);
+  assert.throws(() => resolveCodexRoute('worker', {
+    FACTORY_CODEX_MODEL_WORKER: 'gpt-6.1-sol', FACTORY_CODEX_REASONING_WORKER: 'high',
+  }), /unsupported Codex model/);
+  assert.throws(() => resolveCodexRoute('worker', {
+    FACTORY_CODEX_MODEL_WORKER: 'gpt-5.6-sol', FACTORY_CODEX_REASONING_WORKER: 'extreme',
+  }), /unsupported Codex reasoning/);
 });
 
 const TIERS = {

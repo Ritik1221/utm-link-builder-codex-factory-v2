@@ -13,10 +13,10 @@ pass.
 | Component | Responsibility | May write | Must not do |
 |---|---|---|---|
 | Goal issue | Human product request and initial provider selection | Owner | Mutate the immutable snapshot |
-| Dispatcher | Deterministic transitions, journal, leases, validation, exact-SHA merge | Factory status, task issues, authorized merges | Implement or approve product code |
+| Dispatcher | Deterministic transitions, journal, leases, mechanical exact-SHA approval after independent review, merge | Factory status, task issues, authorized approvals/merges | Implement code or supply the independent review verdict |
 | Provider adapter | Translate one provider-neutral invocation | Invocation result only | Select another provider or decide completion |
 | Codex execution job | Run one invocation against a credential-free exact-SHA archive | Bounded result artifact only | Receive GitHub credentials, `.git`, publish or merge |
-| Trusted publisher | Validate a Codex result and project it into GitHub | Attempt/plan branch, PR, authorized review/receipt | Make lifecycle or completion decisions |
+| Trusted publisher | Validate a Codex result and project it into GitHub; use the owner's narrowly scoped PAT only for branch push and PR authorship | Attempt/plan branch and owner-authored PR; dispatcher token writes review/receipt projections | Expose the PAT to Codex, approve/merge, or make lifecycle/completion decisions |
 | Worker | Implement one assigned attempt | Snapshot working copy only in credential-isolated mode | Review, merge, labels, factory controls |
 | Reviewer | Review one exact SHA | One structured review result | Modify code, merge or change state |
 | GitHub Actions CI | Produce check evidence | Check runs | Declare product completion |
@@ -26,6 +26,11 @@ The dispatcher remains provider-independent. Planner, worker,
 corrective-worker, reviewer and final-reviewer all receive the same versioned,
 content-addressed invocation contract. Claude and Codex adapters implement that
 contract; lifecycle logic exists only in the dispatcher.
+
+For Codex, the invocation also fixes the role-selected model and reasoning
+effort. The isolated CLI receives those explicit values with strict config and
+ignores user configuration; an unavailable or rejected model fails that
+invocation without provider or billing fallback.
 
 ## State ownership
 

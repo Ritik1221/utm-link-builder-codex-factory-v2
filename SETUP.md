@@ -86,3 +86,44 @@ partially configured pair fails closed. Each fire carries `EXPECTED_MODEL`, and 
 session on another model family stops without acting and says so.
 
 To pause everything, pause both routines.
+
+## Codex subscription setup
+
+Codex runs only in the isolated self-hosted execution job. The invocation records
+the selected model and reasoning effort, and the CLI is started with both values
+explicitly. The verified defaults for the installed ChatGPT-authenticated Codex
+CLI 0.146.0 catalog are:
+
+| Role | Model | Reasoning |
+|---|---|---|
+| planner | `gpt-5.6-sol` | high |
+| worker | `gpt-5.6-luna` | medium |
+| corrective-worker | `gpt-5.6-sol` | high |
+| reviewer | `gpt-5.6-sol` | high |
+| final-reviewer | `gpt-5.6-sol` | high |
+
+Override a role only by setting its model and reasoning variables together, for
+example `FACTORY_CODEX_MODEL_WORKER` and `FACTORY_CODEX_REASONING_WORKER`.
+Unsupported or partial pairs fail closed; the runner never silently changes the
+model, provider, or billing mode.
+
+Codex receives an exact-SHA archive without `.git`, GitHub credentials, API keys
+or the publisher token. A GitHub-hosted trusted publisher validates the bounded
+result and authors branches and pull requests with a repository-scoped
+fine-grained PAT. For `Ritik1221`, select only the experiment repository and grant:
+
+- Metadata: read (mandatory GitHub baseline).
+- Contents: read and write (push attempt branches).
+- Pull requests: read and write (create and inspect PRs).
+
+Grant no Actions, Administration, Checks, Environments, Issues, Secrets,
+Variables, Webhooks or Workflows permission. Use a short expiration. After the
+owner separately approves live setup, store it as `FACTORY_PUBLISH_TOKEN` and set
+`FACTORY_PUBLISHER_LOGIN=Ritik1221`. The publish workflow verifies `/user` exactly,
+and rejects a PR not authored by that login. `github-actions[bot]` remains the
+canonical-state writer, exact-SHA approver and merger.
+
+On GitHub Free, enforced branch protection and rulesets are available only for a
+public repository. Use only synthetic, non-secret product code for the live UTM
+experiment. A private GitHub Free repository retains dispatcher checks but cannot
+claim equivalent GitHub-enforced required reviews.
