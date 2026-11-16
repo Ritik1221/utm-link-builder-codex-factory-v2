@@ -1,0 +1,143 @@
+name: publisher-merge-probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: Type publisher-merge-probe to run the one harmless validation PR
+        required: true
+        type: string
+
+concurrency:
+  group: publisher-merge-probe
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  publisher:
+    if: github.repository == 'Ritik1221/utm-link-builder-codex-factory-v2' && inputs.confirm == 'publisher-merge-probe'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: read
+    outputs:
+      branch: ${{ steps.publish.outputs.branch }}
+      head_sha: ${{ steps.publish.outputs.head_sha }}
+      pull_number: ${{ steps.publish.outputs.pull_number }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: main
+          persist-credentials: false
+      - id: publish
+        name: Author one synthetic PR as the trusted publisher
+        shell: bash
+        env:
+          CONTROL_TOKEN: ${{ github.token }}
+          PUBLISH_TOKEN: ${{ secrets.FACTORY_PUBLISH_TOKEN }}
+          PUBLISHER_LOGIN: ${{ vars.FACTORY_PUBLISHER_LOGIN }}
+        run: |
+          set -euo pipefail
+          test -n "$PUBLISH_TOKEN"
+          test "$PUBLISHER_LOGIN" = "Ritik1221"
+          actual_login=$(GH_TOKEN="$PUBLISH_TOKEN" gh api user --jq .login)
+          test "$actual_login" = "$PUBLISHER_LOGIN"
+
+          branch="factory/publisher-probe-${GITHUB_RUN_ID}"
+          git checkout -b "$branch"
+          git config user.name "$PUBLISHER_LOGIN"
+          git config user.email "$PUBLISHER_LOGIN@users.noreply.github.com"
+          mkdir -p probe
+          printf 'publisher=%s\nrun=%s\n' "$PUBLISHER_LOGIN" "$GITHUB_RUN_ID" > probe/publisher-path.txt
+          git add probe/publisher-path.txt
+          git commit -m "test: validate trusted publisher path"
+          head_sha=$(git rev-parse HEAD)
+
+          auth_header=$(printf 'x-access-token:%s' "$PUBLISH_TOKEN" | base64 | tr -d '\n')
+          GIT_CONFIG_COUNT=1 \
+          GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+          GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth_header" \
+            git push origin "HEAD:refs/heads/$branch"
+
+          pull=$(GH_TOKEN="$PUBLISH_TOKEN" gh api --method POST "repos/$GITHUB_REPOSITORY/pulls" \
+            -f title='Validate trusted publisher and protected merge path' \
+            -f head="$branch" -f base=main \
+            -f body="Synthetic non-AI validation from Actions run $GITHUB_RUN_ID.")
+          pull_number=$(jq -r .number <<<"$pull")
+          test "$(jq -r .user.login <<<"$pull")" = "$PUBLISHER_LOGIN"
+          test "$(jq -r .head.sha <<<"$pull")" = "$head_sha"
+
+          GH_TOKEN="$CONTROL_TOKEN" gh api --method POST \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/dispatches" -f ref="$branch"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+          echo "pull_number=$pull_number" >> "$GITHUB_OUTPUT"
+
+  approve-and-merge:
+    needs: publisher
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      actions: write
+      checks: read
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Require exact-SHA CI, approve independently, and merge without bypass
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ needs.publisher.outputs.head_sha }}
+          PULL_NUMBER: ${{ needs.publisher.outputs.pull_number }}
+          PUBLISHER_LOGIN: ${{ vars.FACTORY_PUBLISHER_LOGIN }}
+        run: |
+          set -euo pipefail
+
+          wait_for_checks() {
+            local sha=$1
+            for _ in $(seq 1 120); do
+              checks=$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/check-runs?per_page=100")
+              failed=$(jq '[.check_runs[] | select(.app.slug == "github-actions" and (.name == "ci" or .name == "e2e") and .status == "completed" and .conclusion != "success")] | length' <<<"$checks")
+              test "$failed" = 0 || { echo "required check failed for $sha" >&2; return 1; }
+              passed=$(jq '[.check_runs[] | select(.app.slug == "github-actions" and (.name == "ci" or .name == "e2e") and .status == "completed" and .conclusion == "success") | .name] | unique | length' <<<"$checks")
+              if test "$passed" = 2; then return 0; fi
+              sleep 5
+            done
+            echo "timed out waiting for exact-SHA ci/e2e on $sha" >&2
+            return 1
+          }
+
+          pull=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PULL_NUMBER")
+          test "$(jq -r .user.login <<<"$pull")" = "$PUBLISHER_LOGIN"
+          test "$(jq -r .head.sha <<<"$pull")" = "$HEAD_SHA"
+          test "$(jq -r .base.ref <<<"$pull")" = main
+          test "$(jq -r .state <<<"$pull")" = open
+          wait_for_checks "$HEAD_SHA"
+
+          review=$(gh api --method POST "repos/$GITHUB_REPOSITORY/pulls/$PULL_NUMBER/reviews" \
+            -f commit_id="$HEAD_SHA" -f event=APPROVE \
+            -f body="Independent github-actions exact-SHA approval for synthetic probe $HEAD_SHA.")
+          test "$(jq -r .user.login <<<"$review")" = 'github-actions[bot]'
+          test "$(jq -r .state <<<"$review")" = APPROVED
+          test "$(jq -r .commit_id <<<"$review")" = "$HEAD_SHA"
+
+          merge=$(gh api --method PUT "repos/$GITHUB_REPOSITORY/pulls/$PULL_NUMBER/merge" \
+            -f sha="$HEAD_SHA" -f merge_method=squash)
+          test "$(jq -r .merged <<<"$merge")" = true
+          merge_sha=$(jq -r .sha <<<"$merge")
+          test -n "$merge_sha"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)" = "$merge_sha"
+
+          gh api --method POST "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/dispatches" -f ref=main
+          wait_for_checks "$merge_sha"
+          {
+            echo '### Publisher/approval/merge probe passed'
+            echo "- PR: #$PULL_NUMBER"
+            echo "- Publisher: $PUBLISHER_LOGIN"
+            echo "- Reviewed head: $HEAD_SHA"
+            echo "- Reviewer: github-actions[bot]"
+            echo "- Protected merge commit: $merge_sha"
+            echo '- Exact-head and exact-main ci/e2e: success'
+          } >> "$GITHUB_STEP_SUMMARY"
