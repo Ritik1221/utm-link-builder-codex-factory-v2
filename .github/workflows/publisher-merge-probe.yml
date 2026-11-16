@@ -85,6 +85,10 @@ jobs:
       contents: write
       pull-requests: write
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: main
+          persist-credentials: false
       - name: Require exact-SHA CI, approve independently, and merge without bypass
         shell: bash
         env:
@@ -99,10 +103,9 @@ jobs:
             local sha=$1
             for _ in $(seq 1 120); do
               checks=$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/check-runs?per_page=100")
-              failed=$(jq '[.check_runs[] | select(.app.slug == "github-actions" and (.name == "ci" or .name == "e2e") and .status == "completed" and .conclusion != "success")] | length' <<<"$checks")
-              test "$failed" = 0 || { echo "required check failed for $sha" >&2; return 1; }
-              passed=$(jq '[.check_runs[] | select(.app.slug == "github-actions" and (.name == "ci" or .name == "e2e") and .status == "completed" and .conclusion == "success") | .name] | unique | length' <<<"$checks")
-              if test "$passed" = 2; then return 0; fi
+              state=$(node .github/factory/merge.mjs check <<<"$checks")
+              test "$state" != red || { echo "required check failed for $sha" >&2; return 1; }
+              if test "$state" = green; then return 0; fi
               sleep 5
             done
             echo "timed out waiting for exact-SHA ci/e2e on $sha" >&2
@@ -123,8 +126,7 @@ jobs:
           test "$(jq -r .state <<<"$review")" = APPROVED
           test "$(jq -r .commit_id <<<"$review")" = "$HEAD_SHA"
 
-          merge=$(gh api --method PUT "repos/$GITHUB_REPOSITORY/pulls/$PULL_NUMBER/merge" \
-            -f sha="$HEAD_SHA" -f merge_method=squash)
+          merge=$(node .github/factory/merge.mjs)
           test "$(jq -r .merged <<<"$merge")" = true
           merge_sha=$(jq -r .sha <<<"$merge")
           test -n "$merge_sha"

@@ -18,6 +18,7 @@ import { approveExactCommit, reconcileAgentExecution, reconcileAttempt, reconcil
 import { renderProjectReport } from './report.mjs';
 import { activeFailpoint, hitFailpoint } from './failpoints.mjs';
 import { outputSchemaForRole, parseAgentResultReceipts } from './execution.mjs';
+import { mergeExactSha } from './merge.mjs';
 
 const { GITHUB_TOKEN, GITHUB_REPOSITORY: REPO } = process.env;
 const DISPATCHER = process.env.FACTORY_DISPATCHER_LOGIN;
@@ -687,7 +688,7 @@ async function apply(action, state, notes) {
             notes.push(`Merge of #${action.number} stopped before merge: exact-SHA approval is ${approval}. Branch protection was not bypassed.`);
             return true;
           }
-          await gh('PUT', `${r}/pulls/${action.number}/merge`, { sha: action.sha, merge_method: 'squash' });
+          await mergeExactSha({ gh, repositoryPath: r, pullNumber: action.number, sha: action.sha });
         }
         catch (error) {
           const after = await gh('GET', `${r}/pulls/${action.number}`);

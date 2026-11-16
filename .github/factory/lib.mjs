@@ -255,6 +255,16 @@ export function ciState(checkRuns, name = 'ci') {
   return runs[0].conclusion === 'success' ? 'green' : 'red';
 }
 
+export function requiredChecksState(checkRuns, requiredNames = ['ci', 'e2e']) {
+  const trusted = checkRuns.filter((check) => check.app?.slug === 'github-actions' && requiredNames.includes(check.name));
+  for (const name of requiredNames) {
+    const named = trusted.filter((check) => check.name === name);
+    if (!named.length || named.some((check) => check.status !== 'completed')) return 'pending';
+    if (named.some((check) => check.conclusion !== 'success')) return 'red';
+  }
+  return 'green';
+}
+
 const nonPlaceholder = (value) => typeof value === 'string' && value.trim().length > 0 &&
   !/(placeholder|always\s*pass|echo\s+(ok|pass)|exit\s*\(?\s*0|return\s+true|true\s*;)/i.test(value);
 
